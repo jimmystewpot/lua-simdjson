@@ -134,6 +134,84 @@ t:test("rejects unknown tokens and invalid JSON across all parse entry points wi
     -- including ondemand::json_type::unknown (which calls luaL_error directly
     -- from inside convert_ondemand_element_to_table without throwing a C++
     -- exception) and simdjson::simdjson_error exceptions caught in C++.
+    local tmp_probe_file = "jsonexamples/invalid/_tmp_probe_nan.json"
+    do
+        local pf = io.open(tmp_probe_file, "wb")
+        if pf then
+            pf:write('{"a":1.5,"b":NaN}')
+            pf:close()
+        end
+    end
+    local tmp_probe_err_file = "jsonexamples/invalid/_tmp_probe_err.json"
+    do
+        local pf = io.open(tmp_probe_err_file, "wb")
+        if pf then
+            pf:write('[1.5, 1e9999]')
+            pf:close()
+        end
+    end
+
+    local probes = {
+        {name = "parse(unknown: NaN)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.parse,'NaN'); assert(not ok) end]]},
+        {name = "parse(unknown: [1.5,NaN])",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.parse,'[1.5, NaN]'); assert(not ok) end]]},
+        {name = "parse(unknown: slow_float+NaN)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.parse,'[1.2345678901234567890123456789, NaN]'); assert(not ok) end]]},
+        {name = "parse(unknown: obj NaN)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.parse,'{"a":1,"b":1.5,"c":NaN}'); assert(not ok) end]]},
+        {name = "parse(unknown: nested NaN)",
+         code = [[local s=require('simdjson'); local j=string.rep('{"c":',5)..'{"l":NaN}'..string.rep('}',5); for i=1,50 do local ok=pcall(s.parse,j); assert(not ok) end]]},
+        {name = "parse(simdjson_error: 1e9999)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.parse,'[1.5, 1e9999]'); assert(not ok) end]]},
+        {name = "parse(simdjson_error: bad_esc)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.parse,'{"a":1.5,"b":"\\x"}'); assert(not ok) end]]},
+        {name = "parseFile(unknown: obj NaN)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.parseFile,'jsonexamples/invalid/_tmp_probe_nan.json'); assert(not ok) end]]},
+        {name = "parseFile(simdjson_error: 1e9999)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.parseFile,'jsonexamples/invalid/_tmp_probe_err.json'); assert(not ok) end]]},
+        {name = "parseFile(simdjson_error: enoent)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.parseFile,'jsonexamples/invalid/_does_not_exist.json'); assert(not ok) end]]},
+        {name = "open(simdjson_error: empty)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.open,''); assert(not ok) end]]},
+        {name = "openFile(simdjson_error: enoent)",
+         code = [[local s=require('simdjson'); for i=1,50 do local ok=pcall(s.openFile,'jsonexamples/invalid/_does_not_exist.json'); assert(not ok) end]]},
+        {name = "atPointer(unknown: /b NaN)",
+         code = [[local s=require('simdjson'); for i=1,50 do local d=s.open('{"a":1.5,"b":NaN}'); assert(d:atPointer('/a')==1.5); local ok=pcall(function() return d:atPointer('/b') end); assert(not ok) end]]},
+        {name = "atPointer(unknown: /c [1,2,NaN])",
+         code = [[local s=require('simdjson'); for i=1,50 do local d=s.open('{"a":1.5,"c":[1,2,NaN]}'); local ok=pcall(function() return d:atPointer('/c') end); assert(not ok) end]]},
+        {name = "atPointer(simdjson_error: /missing)",
+         code = [[local s=require('simdjson'); for i=1,50 do local d=s.open('{"a":1.5}'); local ok=pcall(function() return d:atPointer('/missing') end); assert(not ok) end]]},
+        {name = "atPointer(simdjson_error: bad_ptr)",
+         code = [[local s=require('simdjson'); for i=1,50 do local d=s.open('{"a":1.5}'); local ok=pcall(function() return d:atPointer('invalid_pointer') end); assert(not ok) end]]},
+        {name = "parse(nesting depth=25)",
+         code = [[local s=require('simdjson'); local j=string.rep('{"a":',24)..'{}'..string.rep('}',24); assert(s.parse(j))]]},
+        {name = "parse(nesting depth=64)",
+         code = [[local s=require('simdjson'); local j=string.rep('{"a":',63)..'{}'..string.rep('}',63); assert(s.parse(j))]]},
+        {name = "parse(nesting depth=128)",
+         code = [[local s=require('simdjson'); local j=string.rep('{"a":',127)..'{}'..string.rep('}',127); assert(s.parse(j))]]},
+        {name = "parse(nesting depth=256)",
+         code = [[local s=require('simdjson'); local j=string.rep('{"a":',255)..'{}'..string.rep('}',255); assert(s.parse(j))]]},
+    }
+
+    local tmp_probe_script = "jsonexamples/invalid/_tmp_probe_script.lua"
+    for _, p in ipairs(probes) do
+        local sf = io.open(tmp_probe_script, "wb")
+        if sf then
+            sf:write(p.code)
+            sf:close()
+        end
+        local r1, r2, r3 = os.execute("lua " .. tmp_probe_script)
+        local num_code = tonumber(r3) or tonumber(r1) or -1
+        local hex_code = num_code < 0 and (num_code + 0x100000000) or num_code
+        io.write(string.format("[probe] %-36s -> r1=%s r2=%s r3=%s (0x%08X)\n",
+            p.name, tostring(r1), tostring(r2), tostring(r3), hex_code))
+        io.stdout:flush()
+    end
+    os.remove(tmp_probe_script)
+    os.remove(tmp_probe_file)
+    os.remove(tmp_probe_err_file)
+
     local function nested_object_json(depth, leaf_raw)
         return string.rep('{"child":', depth) .. '{"leaf":' .. leaf_raw .. '}' .. string.rep('}', depth)
     end
@@ -179,6 +257,8 @@ t:test("rejects unknown tokens and invalid JSON across all parse entry points wi
 
     local tmp_file = "jsonexamples/invalid/_tmp_parse_crash_test.json"
     for _, case in ipairs(cases) do
+        io.write(string.format("[compile_test] in-process case: %s (parse)\n", case.name))
+        io.stdout:flush()
         local f = io.open(tmp_file, "wb")
         if f then
             f:write(case.json)
@@ -195,7 +275,11 @@ t:test("rejects unknown tokens and invalid JSON across all parse entry points wi
                     message = "parse " .. case.name .. ": " .. tostring(err_p),
                 })
             end
+        end
 
+        io.write(string.format("[compile_test] in-process case: %s (parseFile)\n", case.name))
+        io.stdout:flush()
+        for _ = 1, 50 do
             local ok_f, err_f = pcall(simdjson.parseFile, tmp_file)
             tested.assert({expected = false, actual = ok_f, message = "parseFile: " .. case.name})
             if case.pattern then
@@ -213,6 +297,8 @@ t:test("rejects unknown tokens and invalid JSON across all parse entry points wi
 
     -- Also test open(), openFile(), and atPointer() error paths (both unknown token
     -- via luaL_error and simdjson_error exceptions caught in C++)
+    io.write("[compile_test] in-process case: openFile / atPointer\n")
+    io.stdout:flush()
     for _ = 1, 50 do
         local ok_open_file = pcall(simdjson.openFile, "jsonexamples/invalid/_does_not_exist.json")
         tested.assert({expected = false, actual = ok_open_file, message = "openFile nonexistent"})
