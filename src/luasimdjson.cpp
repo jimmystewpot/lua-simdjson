@@ -160,8 +160,8 @@ static lua_Integer check_integer(lua_State *L, int index, const char *name,
   lua_Number number = lua_tonumber(L, index);
   if (!std::isfinite(number) || std::floor(number) != number || number < 1 ||
       number > static_cast<lua_Number>(maximum)) {
-    luaL_error(L, "%s must be an integer between 1 and %lld", name,
-               static_cast<long long>(maximum));
+    luaL_error(L, "%s must be an integer between 1 and %d", name,
+               static_cast<int>(maximum));
   }
   return static_cast<lua_Integer>(number);
 }
@@ -798,6 +798,9 @@ at_pointer_value(lua_State *L, ondemand::document *document,
                  const char *pointer, size_t pointer_len, int max_depth) {
   decode_context context{max_depth};
   if (pointer_len == 0) {
+    if (!document->is_alive()) {
+      return {decode_status::simdjson_error, simdjson::UNINITIALIZED, 0};
+    }
     document->rewind();
     if (!convert_ondemand_element_to_table(L, *document, context)) {
       return {context.status, context.error, context.detail};

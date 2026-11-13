@@ -50,14 +50,34 @@ end)
 t:test("rejects invalid decode options and overflowing configuration values", function()
     local opened = simdjson.open('{"a": 1}')
 
-    tested.assert_throws_exception({actual = function() simdjson.setMaxDecodeDepth(0) end})
+    local ok_depth_zero, err_depth_zero = pcall(simdjson.setMaxDecodeDepth, 0)
+    tested.assert({expected = false, actual = ok_depth_zero})
+    tested.assert({
+        expected = true,
+        actual = tostring(err_depth_zero):find(
+            "maximum decode depth must be an integer between 1 and 1024",
+            1,
+            true
+        ) ~= nil,
+        message = tostring(err_depth_zero),
+    })
     tested.assert_throws_exception({actual = function() simdjson.setMaxDecodeDepth(1025) end})
     tested.assert_throws_exception({actual = function() simdjson.setMaxDecodeDepth(1.5) end})
     tested.assert_throws_exception({actual = function() simdjson.setMaxDecodeDepth("10") end})
     tested.assert_throws_exception({actual = function() simdjson.setMaxDecodeDepth(4294967297) end})
     tested.assert_throws_exception({actual = function() simdjson.setMaxDecodeDepth(0/0) end})
 
-    tested.assert_throws_exception({actual = function() simdjson.setDecodeBufferSize(0) end})
+    local ok_buf_zero, err_buf_zero = pcall(simdjson.setDecodeBufferSize, 0)
+    tested.assert({expected = false, actual = ok_buf_zero})
+    tested.assert({
+        expected = true,
+        actual = tostring(err_buf_zero):find(
+            "decode buffer size must be an integer between 1 and 67108864",
+            1,
+            true
+        ) ~= nil,
+        message = tostring(err_buf_zero),
+    })
     tested.assert_throws_exception({actual = function() simdjson.setDecodeBufferSize(64 * 1024 * 1024 + 1) end})
     tested.assert_throws_exception({actual = function() simdjson.setDecodeBufferSize(1.5) end})
     tested.assert_throws_exception({actual = function() simdjson.setDecodeBufferSize("1024") end})
@@ -509,6 +529,21 @@ t:test("supports empty root JSON pointer on scalars, objects, and arrays", funct
         local ok, err = pcall(function() return doc:atPointer("") end)
         tested.assert({expected = false, actual = ok, message = "expected trailing content error for: " .. payload})
         tested.assert_truthy({actual = err})
+    end
+
+    -- Calling atPointer("") again after a fatal traversal error must raise a Lua error cleanly
+    for _, payload in ipairs({
+        '{"a":1',
+        '{"a":nil}',
+    }) do
+        local doc = simdjson.open(payload)
+        local ok1, err1 = pcall(function() return doc:atPointer("") end)
+        tested.assert({expected = false, actual = ok1, message = "first atPointer('') should fail for: " .. payload})
+        tested.assert_truthy({actual = err1})
+
+        local ok2, err2 = pcall(function() return doc:atPointer("") end)
+        tested.assert({expected = false, actual = ok2, message = "second atPointer('') should fail for: " .. payload})
+        tested.assert_truthy({actual = err2})
     end
 
     -- Raising maxDepth after a smaller shrink/re-prime must succeed on deep documents
