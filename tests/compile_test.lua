@@ -128,4 +128,140 @@ t:test("Make sure invalid files are not accepted", function()
     end
 end)
 
+t:test("rejects unknown tokens and invalid JSON across all parse entry points with a recoverable error", function()
+    -- Mirror PR #119's encoder error test: exercise every distinct error site
+    -- on the parse(), parseFile(), open(), openFile(), and atPointer() paths,
+    -- including ondemand::json_type::unknown (which calls luaL_error directly
+    -- from inside convert_ondemand_element_to_table without throwing a C++
+    -- exception) and simdjson::simdjson_error exceptions caught in C++.
+    local function nested_object_json(depth, leaf_raw)
+        return string.rep('{"child":', depth) .. '{"leaf":' .. leaf_raw .. '}' .. string.rep('}', depth)
+    end
+
+    local function nested_array_json(depth, leaf_raw)
+        return string.rep('[', depth) .. '[' .. leaf_raw .. ']' .. string.rep(']', depth)
+    end
+
+    local cases = {
+        {name = "root unknown token NaN", pattern = "unknown or unsupported type",
+         json = "NaN"},
+        {name = "root unknown token Infinity", pattern = "unknown or unsupported type",
+         json = "Infinity"},
+        {name = "root unknown token +1", pattern = "unknown or unsupported type",
+         json = "+1"},
+        {name = "root unknown token undefined", pattern = "unknown or unsupported type",
+         json = "undefined"},
+        {name = "unknown token in array", pattern = "unknown or unsupported type",
+         json = "[NaN]"},
+        {name = "unknown token after integers in array", pattern = "unknown or unsupported type",
+         json = "[1, 2, NaN]"},
+        {name = "unknown token after float in array", pattern = "unknown or unsupported type",
+         json = "[1.5, NaN]"},
+        {name = "unknown token after slow float in array", pattern = "unknown or unsupported type",
+         json = "[1.2345678901234567890123456789, NaN]"},
+        {name = "unknown token in object", pattern = "unknown or unsupported type",
+         json = '{"a":NaN}'},
+        {name = "unknown token after valid entries in object", pattern = "unknown or unsupported type",
+         json = '{"a":1,"b":1.5,"c":NaN}'},
+        {name = "unknown token after slow float in object", pattern = "unknown or unsupported type",
+         json = '{"a":1.2345678901234567890123456789,"b":NaN}'},
+        {name = "unknown token nested in object", pattern = "unknown or unsupported type",
+         json = nested_object_json(5, "NaN")},
+        {name = "unknown token nested in array", pattern = "unknown or unsupported type",
+         json = nested_array_json(5, "NaN")},
+        {name = "invalid number after float in array", pattern = nil,
+         json = "[1.5, 1e9999]"},
+        {name = "invalid string escape in object", pattern = nil,
+         json = '{"a":1.5,"b":"\\x"}'},
+        {name = "non-string key in object", pattern = nil,
+         json = '{"a":1.5, 2: 3}'},
+    }
+
+    local tmp_file = "jsonexamples/invalid/_tmp_parse_crash_test.json"
+    for _, case in ipairs(cases) do
+        local f = io.open(tmp_file, "wb")
+        if f then
+            f:write(case.json)
+            f:close()
+        end
+
+        for _ = 1, 50 do
+            local ok_p, err_p = pcall(simdjson.parse, case.json)
+            tested.assert({expected = false, actual = ok_p, message = "parse: " .. case.name})
+            if case.pattern then
+                tested.assert({
+                    expected = true,
+                    actual = tostring(err_p):find(case.pattern, 1, true) ~= nil,
+                    message = "parse " .. case.name .. ": " .. tostring(err_p),
+                })
+            end
+
+            local ok_f, err_f = pcall(simdjson.parseFile, tmp_file)
+            tested.assert({expected = false, actual = ok_f, message = "parseFile: " .. case.name})
+            if case.pattern then
+                tested.assert({
+                    expected = true,
+                    actual = tostring(err_f):find(case.pattern, 1, true) ~= nil,
+                    message = "parseFile " .. case.name .. ": " .. tostring(err_f),
+                })
+            end
+        end
+
+        tested.assert({expected = true, actual = simdjson.parse('{"valid":true}').valid})
+    end
+    os.remove(tmp_file)
+
+    -- Also test open(), openFile(), and atPointer() error paths (both unknown token
+    -- via luaL_error and simdjson_error exceptions caught in C++)
+    for _ = 1, 50 do
+        local ok_open_file = pcall(simdjson.openFile, "jsonexamples/invalid/_does_not_exist.json")
+        tested.assert({expected = false, actual = ok_open_file, message = "openFile nonexistent"})
+
+        local doc = simdjson.open('{"a":1.5,"b":NaN,"c":[1,2,NaN]}')
+        tested.assert({expected = 1.5, actual = doc:atPointer("/a")})
+
+        local ok_ptr, err_ptr = pcall(function() return doc:atPointer("/b") end)
+        tested.assert({expected = false, actual = ok_ptr, message = "atPointer unknown token"})
+        tested.assert({
+            expected = true,
+            actual = tostring(err_ptr):find("unknown or unsupported type", 1, true) ~= nil,
+            message = "atPointer: " .. tostring(err_ptr),
+        })
+
+        local ok_ptr_arr, err_ptr_arr = pcall(function() return doc:atPointer("/c") end)
+        tested.assert({expected = false, actual = ok_ptr_arr, message = "atPointer array with unknown token"})
+        tested.assert({
+            expected = true,
+            actual = tostring(err_ptr_arr):find("unknown or unsupported type", 1, true) ~= nil,
+            message = "atPointer array: " .. tostring(err_ptr_arr),
+        })
+
+        local ok_ptr_missing = pcall(function() return doc:atPointer("/missing") end)
+        tested.assert({expected = false, actual = ok_ptr_missing, message = "atPointer missing key"})
+
+        local ok_ptr_bad = pcall(function() return doc:atPointer("invalid_pointer") end)
+        tested.assert({expected = false, actual = ok_ptr_bad, message = "atPointer malformed pointer"})
+    end
+    io.write("[compile_test] unknown-token / luaL_error test completed\n")
+    io.stdout:flush()
+end)
+
+t:test("parses nesting up to the depth limit without exhausting the Lua stack", function()
+    -- Mirror PR #119's stack overflow test on the parse() path:
+    -- Each level of nesting in convert_ondemand_element_to_table pushes
+    -- Lua stack slots (table + key/index) before recursing, without calling
+    -- lua_checkstack. A C function is only guaranteed LUA_MINSTACK (20).
+    for _, depth in ipairs({10, 25, 64, 128}) do
+        io.write(string.format("[compile_test] testing parse nesting depth=%d\n", depth))
+        io.stdout:flush()
+        local object_json = string.rep('{"a":', depth - 1) .. "{}" .. string.rep("}", depth - 1)
+        local parsed_obj = simdjson.parse(object_json)
+        tested.assert_truthy({actual = parsed_obj, message = "objects " .. depth})
+
+        local array_json = string.rep("[", depth - 1) .. "{}" .. string.rep("]", depth - 1)
+        local parsed_arr = simdjson.parse(array_json)
+        tested.assert_truthy({actual = parsed_arr, message = "arrays " .. depth})
+    end
+end)
+
 return t
