@@ -782,19 +782,30 @@ t:test("isolates active decoder state from reentrant parse and parseFile calls i
         end
 
         do
+            local co_abort_active = false
             local co = coroutine.create(function()
                 collectgarbage("stop")
                 local batch = {}
                 for i = 1, 200 do
                     batch[i] = make_gc_canary(function()
-                        error("abort from finalizer")
+                        if co_abort_active then
+                            co_abort_active = false
+                            error("abort from finalizer")
+                        end
                     end)
                 end
                 batch = nil
+                co_abort_active = true
                 collectgarbage("restart")
                 return simdjson.parse(outer_json, decode_opts)
             end)
             coroutine.resume(co)
+            co_abort_active = false
+            local reclaimed = simdjson.parse('{"reclaimed":true}', {bufferSize = 2048})
+            local caps_live_err_co = simdjson._debugDecodeCapacities()
+            if reclaimed.reclaimed ~= true or caps_live_err_co.inUse ~= false or caps_live_err_co.parseBuffer ~= 2048 + 64 then
+                unexpected_errors = unexpected_errors + 1
+            end
             co = nil
             collectgarbage("collect")
             collectgarbage("collect")
@@ -802,7 +813,8 @@ t:test("isolates active decoder state from reentrant parse and parseFile calls i
             if #after_co ~= 400 or after_co[1].idx ~= 1 or after_co[400].idx ~= 400 then
                 unexpected_errors = unexpected_errors + 1
             end
-            if simdjson._debugDecodeCapacities().inUse ~= false then
+            local caps_after_co = simdjson._debugDecodeCapacities()
+            if caps_after_co.inUse ~= false or caps_after_co.parseBuffer ~= 0 then
                 unexpected_errors = unexpected_errors + 1
             end
         end
