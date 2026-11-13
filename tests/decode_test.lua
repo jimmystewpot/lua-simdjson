@@ -712,11 +712,17 @@ t:test("isolates active decoder state from reentrant parse and parseFile calls i
         f:close()
 
         local reentrant_calls = 0
-        local mid_decode_calls = 0
+        local mid_decode_file_calls = 0
+        local mid_decode_str_calls = 0
+        local active_mode = nil
         local function gc_callback()
             reentrant_calls = reentrant_calls + 1
             if simdjson._debugDecodeCapacities().inUse then
-                mid_decode_calls = mid_decode_calls + 1
+                if active_mode == "file" then
+                    mid_decode_file_calls = mid_decode_file_calls + 1
+                elseif active_mode == "str" then
+                    mid_decode_str_calls = mid_decode_str_calls + 1
+                end
             end
             local ok_missing = pcall(simdjson.parseFile, "jsonexamples/invalid/does_not_exist.json")
             assert(not ok_missing)
@@ -728,39 +734,62 @@ t:test("isolates active decoder state from reentrant parse and parseFile calls i
             assert(small_str.nested == 42)
         end
 
+        local ok_pause, old_pause = pcall(collectgarbage, "setpause", 50)
+        local ok_step, old_step = pcall(collectgarbage, "setstepmul", 1000)
+        local ok_param_pause, old_param_pause = pcall(collectgarbage, "param", "pause", 50)
+        local ok_param_step, old_param_step = pcall(collectgarbage, "param", "stepmul", 1000)
         collectgarbage("collect")
-        local ok_pause, old_pause = pcall(collectgarbage, "setpause", 60)
-        local ok_step, old_step = pcall(collectgarbage, "setstepmul", 400)
-        for _ = 1, 5 do
+
+        local unexpected_errors = 0
+        local file_iters = 0
+        while mid_decode_file_calls == 0 and file_iters < 50 do
+            file_iters = file_iters + 1
             local batch = {}
             for i = 1, 200 do
                 batch[i] = make_gc_canary(gc_callback)
             end
-            batch = nil -- make unreachable right before outer parseFile/parse
+            batch = nil
+            active_mode = "file"
             local parsed_file = simdjson.parseFile(tmp_outer, {bufferSize = 1024})
-            tested.assert({expected = 400, actual = #parsed_file})
-            tested.assert({expected = 1, actual = parsed_file[1].idx})
-            tested.assert({expected = 400, actual = parsed_file[400].idx})
+            active_mode = nil
+            if #parsed_file ~= 400 or parsed_file[1].idx ~= 1 or parsed_file[400].idx ~= 400 then
+                unexpected_errors = unexpected_errors + 1
+            end
+        end
 
-            batch = {}
+        local str_iters = 0
+        while mid_decode_str_calls == 0 and str_iters < 50 do
+            str_iters = str_iters + 1
+            local batch = {}
             for i = 1, 200 do
                 batch[i] = make_gc_canary(gc_callback)
             end
             batch = nil
+            active_mode = "str"
             local parsed_str = simdjson.parse(outer_json, {bufferSize = 1024})
-            tested.assert({expected = 400, actual = #parsed_str})
-            tested.assert({expected = 1, actual = parsed_str[1].idx})
-            tested.assert({expected = 400, actual = parsed_str[400].idx})
+            active_mode = nil
+            if #parsed_str ~= 400 or parsed_str[1].idx ~= 1 or parsed_str[400].idx ~= 400 then
+                unexpected_errors = unexpected_errors + 1
+            end
         end
+
         if ok_pause and type(old_pause) == "number" and old_pause > 0 then
             pcall(collectgarbage, "setpause", old_pause)
         end
         if ok_step and type(old_step) == "number" and old_step > 0 then
             pcall(collectgarbage, "setstepmul", old_step)
         end
+        if ok_param_pause and type(old_param_pause) == "number" and old_param_pause > 0 then
+            pcall(collectgarbage, "param", "pause", old_param_pause)
+        end
+        if ok_param_step and type(old_param_step) == "number" and old_param_step > 0 then
+            pcall(collectgarbage, "param", "stepmul", old_param_step)
+        end
         collectgarbage("collect")
+        tested.assert({expected = 0, actual = unexpected_errors})
         tested.assert({expected = true, actual = reentrant_calls > 0})
-        tested.assert({expected = true, actual = mid_decode_calls > 0})
+        tested.assert({expected = true, actual = mid_decode_file_calls > 0})
+        tested.assert({expected = true, actual = mid_decode_str_calls > 0})
     end)
 
     os.remove(tmp_outer)
