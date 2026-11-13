@@ -5,6 +5,19 @@ t = tested.new()
 
 local original_max_depth
 local original_buffer_size
+local is_windows = package.config:sub(1, 1) == "\\"
+
+local function make_temp_path()
+    local name = os.tmpname()
+    if is_windows and not name:match("^[A-Za-z]:") then
+        local dir = os.getenv("TEMP") or os.getenv("TMP") or "."
+        if name:sub(1, 1) ~= "\\" and name:sub(1, 1) ~= "/" then
+            name = "\\" .. name
+        end
+        name = dir .. name
+    end
+    return name
+end
 
 t:before_each(function()
     if simdjson.getMaxDecodeDepth then
@@ -113,9 +126,9 @@ t:test("enforces maxDepth in parse and parseFile and recovers cleanly", function
     local deep_obj = string.rep('{"a":', 5) .. '1' .. string.rep('}', 5)
     local deep_arr = string.rep('[', 5) .. '1' .. string.rep(']', 5)
 
-    local tmp_obj = os.tmpname()
-    local tmp_arr = os.tmpname()
-    local tmp_invalid = os.tmpname()
+    local tmp_obj = make_temp_path()
+    local tmp_arr = make_temp_path()
+    local tmp_invalid = make_temp_path()
 
     local function write_file(path, content)
         local f = assert(io.open(path, "wb"))
@@ -255,6 +268,10 @@ t:test("decodes nesting up to the depth limit (1024) without exhausting the Lua 
 end)
 
 local function get_rss_kb()
+    if is_windows then
+        return nil
+    end
+
     local status_file = io.open("/proc/self/status", "r")
     if status_file then
         local content = status_file:read("*all")
@@ -292,8 +309,8 @@ t:test("shrinks oversized decode buffers back to bufferSize after large valid or
     local payload_size = 4 * 1024 * 1024
     local big_valid = '{"data":"' .. string.rep("x", payload_size) .. '"}'
     local big_invalid = '{"data":"' .. string.rep("x", payload_size) .. '", "bad": nil}'
-    local tmp_valid = os.tmpname()
-    local tmp_invalid = os.tmpname()
+    local tmp_valid = make_temp_path()
+    local tmp_invalid = make_temp_path()
 
     local ok_run, run_err = pcall(function()
         local f_valid = assert(io.open(tmp_valid, "wb"))
@@ -346,17 +363,19 @@ t:test("shrinks oversized decode buffers back to bufferSize after large valid or
         collectgarbage("collect")
         collectgarbage("collect")
         local rss_after = get_rss_kb()
-        local rss_delta = rss_after - rss_before
-        tested.assert({
-            expected = true,
-            actual = rss_delta < 2048,
-            message = string.format(
-                "expected oversized decode buffers to shrink (< 2048 KiB delta), got %d KiB (before=%d, after=%d)",
-                rss_delta,
-                rss_before,
-                rss_after
-            ),
-        })
+        if rss_before and rss_after then
+            local rss_delta = rss_after - rss_before
+            tested.assert({
+                expected = true,
+                actual = rss_delta < 2048,
+                message = string.format(
+                    "expected oversized decode buffers to shrink (< 2048 KiB delta), got %d KiB (before=%d, after=%d)",
+                    rss_delta,
+                    rss_before,
+                    rss_after
+                ),
+            })
+        end
     end)
 
     os.remove(tmp_valid)
@@ -370,8 +389,8 @@ t:test("does not leak memory across repeated parse and parseFile errors", functi
     local padding = string.rep("x", 10 * 1024)
     local invalid_syntax = '{"pad":"' .. padding .. '", "bad": nil}'
     local invalid_unknown = '{"pad":"' .. padding .. '", "bad": NaN}'
-    local tmp_syntax = os.tmpname()
-    local tmp_unknown = os.tmpname()
+    local tmp_syntax = make_temp_path()
+    local tmp_unknown = make_temp_path()
 
     local ok_run, run_err = pcall(function()
         local f_syntax = assert(io.open(tmp_syntax, "wb"))
@@ -409,17 +428,19 @@ t:test("does not leak memory across repeated parse and parseFile errors", functi
         collectgarbage("collect")
         collectgarbage("collect")
         local rss_after = get_rss_kb()
-        local rss_delta = rss_after - rss_before
-        tested.assert({
-            expected = true,
-            actual = rss_delta < 2048,
-            message = string.format(
-                "expected error-path RSS growth < 2048 KiB, got %d KiB (before=%d, after=%d)",
-                rss_delta,
-                rss_before,
-                rss_after
-            ),
-        })
+        if rss_before and rss_after then
+            local rss_delta = rss_after - rss_before
+            tested.assert({
+                expected = true,
+                actual = rss_delta < 2048,
+                message = string.format(
+                    "expected error-path RSS growth < 2048 KiB, got %d KiB (before=%d, after=%d)",
+                    rss_delta,
+                    rss_before,
+                    rss_after
+                ),
+            })
+        end
     end)
 
     os.remove(tmp_syntax)
@@ -553,17 +574,19 @@ t:test("does not leak memory across repeated open, openFile, and atPointer error
     collectgarbage("collect")
     collectgarbage("collect")
     local rss_after = get_rss_kb()
-    local rss_delta = rss_after - rss_before
-    tested.assert({
-        expected = true,
-        actual = rss_delta < 2048,
-        message = string.format(
-            "expected open/openFile/atPointer error-path RSS growth < 2048 KiB, got %d KiB (before=%d, after=%d)",
-            rss_delta,
-            rss_before,
-            rss_after
-        ),
-    })
+    if rss_before and rss_after then
+        local rss_delta = rss_after - rss_before
+        tested.assert({
+            expected = true,
+            actual = rss_delta < 2048,
+            message = string.format(
+                "expected open/openFile/atPointer error-path RSS growth < 2048 KiB, got %d KiB (before=%d, after=%d)",
+                rss_delta,
+                rss_before,
+                rss_after
+            ),
+        })
+    end
 end)
 
 return t

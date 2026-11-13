@@ -1,16 +1,20 @@
-#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
+// clang-format off
 #include <lua.hpp>
+#include <lauxlib.h>
+// clang-format on
 #include <memory>
 #include <new>
 
 #define NDEBUG
 #define __OPTIMIZE__ 1
 
-#include "luasimdjson.h"
+// clang-format off
 #include "simdjson.h"
+#include "luasimdjson.h"
+// clang-format on
 
 #define LUA_SIMDJSON_NAME "simdjson"
 #define LUA_SIMDJSON_VERSION "1.0.1"
@@ -142,7 +146,8 @@ static void shrink_decode_buffers(size_t desired_buffer_size,
 static simdjson::error_code
 ensure_ondemand_parser_ready(size_t doc_len, size_t desired_buffer_size,
                              int max_depth) noexcept {
-  size_t target_capacity = std::max(doc_len, desired_buffer_size);
+  size_t target_capacity =
+      doc_len > desired_buffer_size ? doc_len : desired_buffer_size;
   size_t target_depth = static_cast<size_t>(max_depth);
   if (ondemand_parser.capacity() < target_capacity ||
       ondemand_parser.max_depth() < target_depth) {
@@ -505,8 +510,9 @@ parse_value(lua_State *L, const char *json_str, size_t json_str_len,
     return {decode_status::input_too_large, simdjson::SUCCESS, 0};
   }
 
-  size_t required_capacity =
-      std::max(json_str_len, desired_buffer_size) + SIMDJSON_PADDING;
+  size_t base_capacity =
+      json_str_len > desired_buffer_size ? json_str_len : desired_buffer_size;
+  size_t required_capacity = base_capacity + SIMDJSON_PADDING;
   if (parse_buffer_capacity < required_capacity) {
     char *replacement = new (std::nothrow) char[required_capacity];
     if (replacement == nullptr) {
