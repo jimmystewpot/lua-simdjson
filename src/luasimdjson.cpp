@@ -20,6 +20,7 @@
 #define LUA_SIMDJSON_VERSION "1.0.1"
 #define LUA_SIMDJSON_MAX_DECODE_DEPTH_KEY "simdjson.maxDecodeDepth"
 #define LUA_SIMDJSON_DECODE_BUFFER_SIZE_KEY "simdjson.decodeBufferSize"
+#define LUA_SIMDJSON_DECODE_LEASE_META "simdjson.decode_vm_lease"
 #define DEFAULT_MAX_DECODE_DEPTH static_cast<int>(simdjson::DEFAULT_MAX_DEPTH)
 #define MAX_DECODE_DEPTH static_cast<int>(simdjson::DEFAULT_MAX_DEPTH)
 #define DEFAULT_DECODE_BUFFER_SIZE (16 * 1024)
@@ -114,16 +115,82 @@ static void luaL_setfuncs(lua_State *L, const luaL_Reg *l, int nup) {
 }
 #endif
 
+static int decode_vm_lease_key_anchor = 0;
+static int decode_active_thread_key_anchor = 0;
+
+struct decode_vm_lease {
+  lua_State *active_thread;
+};
+
 struct reusable_decode_state {
   ondemand::parser parser;
   std::unique_ptr<char[]> parse_buffer;
   size_t parse_buffer_capacity = 0;
   simdjson::padded_string file_parse_buffer;
   bool in_use = false;
-  lua_State *active_state = nullptr;
+  decode_vm_lease *owner_vm = nullptr;
 };
 
 thread_local reusable_decode_state tls_decode_state;
+
+static int decode_vm_lease_gc(lua_State *L) {
+  decode_vm_lease *vm_lease =
+      reinterpret_cast<decode_vm_lease *>(lua_touserdata(L, 1));
+  if (vm_lease != nullptr) {
+    vm_lease->active_thread = nullptr;
+    if (tls_decode_state.owner_vm == vm_lease) {
+      tls_decode_state.in_use = false;
+      tls_decode_state.owner_vm = nullptr;
+    }
+  }
+  return 0;
+}
+
+static decode_vm_lease *ensure_decode_vm_lease(lua_State *L) {
+  lua_pushlightuserdata(L, &decode_vm_lease_key_anchor);
+  lua_rawget(L, LUA_REGISTRYINDEX);
+  decode_vm_lease *vm_lease =
+      reinterpret_cast<decode_vm_lease *>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  if (vm_lease != nullptr) {
+    return vm_lease;
+  }
+
+  lua_pushlightuserdata(L, &decode_active_thread_key_anchor);
+  lua_pushboolean(L, 0);
+  lua_rawset(L, LUA_REGISTRYINDEX);
+
+  vm_lease = reinterpret_cast<decode_vm_lease *>(
+      lua_newuserdata(L, sizeof(decode_vm_lease)));
+  vm_lease->active_thread = nullptr;
+  if (luaL_newmetatable(L, LUA_SIMDJSON_DECODE_LEASE_META) != 0) {
+    lua_pushcfunction(L, decode_vm_lease_gc);
+    lua_setfield(L, -2, "__gc");
+  }
+  lua_setmetatable(L, -2);
+
+  lua_pushlightuserdata(L, &decode_vm_lease_key_anchor);
+  lua_pushvalue(L, -2);
+  lua_rawset(L, LUA_REGISTRYINDEX);
+  lua_pop(L, 1);
+  return vm_lease;
+}
+
+static void write_active_decode_thread(decode_vm_lease *vm_lease, lua_State *L,
+                                       bool active) noexcept {
+  if (vm_lease == nullptr || L == nullptr) {
+    return;
+  }
+  lua_pushlightuserdata(L, &decode_active_thread_key_anchor);
+  if (active) {
+    lua_pushthread(L);
+    vm_lease->active_thread = L;
+  } else {
+    lua_pushboolean(L, 0);
+    vm_lease->active_thread = nullptr;
+  }
+  lua_rawset(L, LUA_REGISTRYINDEX);
+}
 
 static bool is_decode_active_on_call_stack(lua_State *L, int start_level) {
   if (L == nullptr) {
@@ -131,6 +198,9 @@ static bool is_decode_active_on_call_stack(lua_State *L, int start_level) {
   }
   lua_Debug ar;
   for (int level = start_level; lua_getstack(L, level, &ar) != 0; ++level) {
+    if (!lua_checkstack(L, 1)) {
+      return true;
+    }
     if (lua_getinfo(L, "f", &ar) != 0) {
       lua_CFunction fn = lua_tocfunction(L, -1);
       lua_pop(L, 1);
@@ -145,18 +215,35 @@ static bool is_decode_active_on_call_stack(lua_State *L, int start_level) {
 struct decode_state_lease {
   reusable_decode_state fallback;
   reusable_decode_state *state;
+  decode_vm_lease *owner_vm;
+  lua_State *lease_thread;
   bool using_tls;
 
-  explicit decode_state_lease(lua_State *L) noexcept {
-    int start_level = (tls_decode_state.active_state == L) ? 1 : 0;
+  decode_state_lease(lua_State *L, decode_vm_lease *vm_lease) noexcept {
+    lua_State *prev_thread =
+        (tls_decode_state.in_use && tls_decode_state.owner_vm != nullptr)
+            ? tls_decode_state.owner_vm->active_thread
+            : nullptr;
+    int start_level = (prev_thread == L) ? 1 : 0;
     if (!tls_decode_state.in_use ||
-        !is_decode_active_on_call_stack(tls_decode_state.active_state,
-                                        start_level)) {
+        !is_decode_active_on_call_stack(prev_thread, start_level)) {
+      if (tls_decode_state.owner_vm != nullptr &&
+          tls_decode_state.owner_vm != vm_lease &&
+          tls_decode_state.owner_vm->active_thread != nullptr) {
+        write_active_decode_thread(tls_decode_state.owner_vm,
+                                   tls_decode_state.owner_vm->active_thread,
+                                   false);
+      }
+      write_active_decode_thread(vm_lease, L, true);
       tls_decode_state.in_use = true;
-      tls_decode_state.active_state = L;
+      tls_decode_state.owner_vm = vm_lease;
+      owner_vm = vm_lease;
+      lease_thread = L;
       state = &tls_decode_state;
       using_tls = true;
     } else {
+      owner_vm = nullptr;
+      lease_thread = nullptr;
       state = &fallback;
       using_tls = false;
     }
@@ -164,8 +251,9 @@ struct decode_state_lease {
 
   ~decode_state_lease() noexcept {
     if (using_tls) {
+      write_active_decode_thread(owner_vm, lease_thread, false);
       tls_decode_state.in_use = false;
-      tls_decode_state.active_state = nullptr;
+      tls_decode_state.owner_vm = nullptr;
     }
   }
 };
@@ -543,9 +631,9 @@ static bool convert_ondemand_element_to_table(lua_State *L, T &element,
 }
 
 static LUA_SIMDJSON_NOINLINE decode_outcome
-parse_value(lua_State *L, const char *json_str, size_t json_str_len,
-            int max_depth, size_t desired_buffer_size) {
-  decode_state_lease lease(L);
+parse_value(lua_State *L, decode_vm_lease *vm_lease, const char *json_str,
+            size_t json_str_len, int max_depth, size_t desired_buffer_size) {
+  decode_state_lease lease(L, vm_lease);
   reusable_decode_state &state = *lease.state;
   shrink_decode_buffers(state, desired_buffer_size);
 
@@ -586,13 +674,16 @@ parse_value(lua_State *L, const char *json_str, size_t json_str_len,
     return {decode_status::simdjson_error, error, 0};
   }
 
+  const int initial_top = lua_gettop(L);
   decode_context context{max_depth};
   if (!convert_ondemand_element_to_table(L, doc, context)) {
+    lua_settop(L, initial_top);
     shrink_decode_buffers(state, desired_buffer_size);
     return {context.status, context.error, context.detail};
   }
 
   if (!doc.at_end()) {
+    lua_settop(L, initial_top);
     shrink_decode_buffers(state, desired_buffer_size);
     return {decode_status::simdjson_error, simdjson::TRAILING_CONTENT, 0};
   }
@@ -601,10 +692,10 @@ parse_value(lua_State *L, const char *json_str, size_t json_str_len,
   return {decode_status::ok, simdjson::SUCCESS, 0};
 }
 
-static LUA_SIMDJSON_NOINLINE decode_outcome
-parse_file_value(lua_State *L, const char *json_file, size_t json_file_len,
-                 int max_depth, size_t desired_buffer_size) {
-  decode_state_lease lease(L);
+static LUA_SIMDJSON_NOINLINE decode_outcome parse_file_value(
+    lua_State *L, decode_vm_lease *vm_lease, const char *json_file,
+    size_t json_file_len, int max_depth, size_t desired_buffer_size) {
+  decode_state_lease lease(L, vm_lease);
   reusable_decode_state &state = *lease.state;
   shrink_decode_buffers(state, desired_buffer_size);
 
@@ -634,13 +725,16 @@ parse_file_value(lua_State *L, const char *json_file, size_t json_file_len,
     return {decode_status::simdjson_error, error, 0};
   }
 
+  const int initial_top = lua_gettop(L);
   decode_context context{max_depth};
   if (!convert_ondemand_element_to_table(L, doc, context)) {
+    lua_settop(L, initial_top);
     shrink_decode_buffers(state, desired_buffer_size);
     return {context.status, context.error, context.detail};
   }
 
   if (!doc.at_end()) {
+    lua_settop(L, initial_top);
     shrink_decode_buffers(state, desired_buffer_size);
     return {decode_status::simdjson_error, simdjson::TRAILING_CONTENT, 0};
   }
@@ -663,9 +757,10 @@ static int parse(lua_State *L) {
     parse_decode_options(L, 2, max_depth, desired_buffer_size);
   }
 
+  decode_vm_lease *vm_lease = ensure_decode_vm_lease(L);
   const int initial_top = lua_gettop(L);
-  decode_outcome outcome =
-      parse_value(L, json_str, json_str_len, max_depth, desired_buffer_size);
+  decode_outcome outcome = parse_value(L, vm_lease, json_str, json_str_len,
+                                       max_depth, desired_buffer_size);
   if (outcome.status != decode_status::ok) {
     lua_settop(L, initial_top);
     return raise_decode_error(L, outcome);
@@ -688,9 +783,10 @@ static int parse_file(lua_State *L) {
     parse_decode_options(L, 2, max_depth, desired_buffer_size);
   }
 
+  decode_vm_lease *vm_lease = ensure_decode_vm_lease(L);
   const int initial_top = lua_gettop(L);
-  decode_outcome outcome = parse_file_value(L, json_file, json_file_len,
-                                            max_depth, desired_buffer_size);
+  decode_outcome outcome = parse_file_value(
+      L, vm_lease, json_file, json_file_len, max_depth, desired_buffer_size);
   if (outcome.status != decode_status::ok) {
     lua_settop(L, initial_top);
     return raise_decode_error(L, outcome);
@@ -722,6 +818,12 @@ static int get_decode_buffer_size(lua_State *L) {
 }
 
 static int debug_decode_capacities(lua_State *L) {
+  lua_State *active_thread =
+      (tls_decode_state.in_use && tls_decode_state.owner_vm != nullptr)
+          ? tls_decode_state.owner_vm->active_thread
+          : nullptr;
+  bool in_use = tls_decode_state.in_use &&
+                is_decode_active_on_call_stack(active_thread, 0);
   lua_newtable(L);
   lua_pushinteger(
       L, static_cast<lua_Integer>(tls_decode_state.parse_buffer_capacity));
@@ -732,7 +834,7 @@ static int debug_decode_capacities(lua_State *L) {
   lua_pushinteger(L,
                   static_cast<lua_Integer>(tls_decode_state.parser.capacity()));
   lua_setfield(L, -2, "parserCapacity");
-  lua_pushboolean(L, tls_decode_state.in_use ? 1 : 0);
+  lua_pushboolean(L, in_use ? 1 : 0);
   lua_setfield(L, -2, "inUse");
   return 1;
 }
@@ -945,10 +1047,13 @@ static const struct luaL_Reg arraylib_m[] = {
     {NULL, NULL}};
 
 int luaopen_simdjson(lua_State *L) {
+  ensure_decode_vm_lease(L);
+
   luaL_newmetatable(L, LUA_MYOBJECT);
   lua_pushvalue(L, -1); /* duplicates the metatable */
   lua_setfield(L, -2, "__index");
   luaL_setfuncs(L, arraylib_m, 0);
+  lua_pop(L, 1);
 
   // luaL_newlib(L, luasimdjson);
 
