@@ -429,21 +429,27 @@ t:test("does not leak memory across repeated parse and parseFile errors", functi
         local rss_before = get_rss_kb()
 
         local unexpected_successes = 0
-        for _ = 1, 15000 do
+        for i = 1, 15000 do
             if pcall(simdjson.parse, invalid_syntax) then
                 unexpected_successes = unexpected_successes + 1
             end
             if pcall(simdjson.parse, invalid_unknown) then
                 unexpected_successes = unexpected_successes + 1
             end
+            if i % 500 == 0 then
+                collectgarbage("collect")
+            end
         end
 
-        for _ = 1, 2500 do
+        for i = 1, 2500 do
             if pcall(simdjson.parseFile, tmp_syntax) then
                 unexpected_successes = unexpected_successes + 1
             end
             if pcall(simdjson.parseFile, tmp_unknown) then
                 unexpected_successes = unexpected_successes + 1
+            end
+            if i % 500 == 0 then
+                collectgarbage("collect")
             end
         end
 
@@ -573,7 +579,7 @@ t:test("does not leak memory across repeated open, openFile, and atPointer error
     local rss_before = get_rss_kb()
 
     local unexpected_successes = 0
-    for _ = 1, 5000 do
+    for i = 1, 5000 do
         if pcall(simdjson.open, invalid_open) then
             unexpected_successes = unexpected_successes + 1
         end
@@ -593,6 +599,9 @@ t:test("does not leak memory across repeated open, openFile, and atPointer error
             unexpected_successes = unexpected_successes + 1
         end
         simdjson.activeImplementation()
+        if i % 500 == 0 then
+            collectgarbage("collect")
+        end
     end
 
     collectgarbage("collect")
