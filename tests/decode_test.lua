@@ -740,17 +740,20 @@ t:test("isolates active decoder state from reentrant parse and parseFile calls i
         local ok_param_step, old_param_step = pcall(collectgarbage, "param", "stepmul", 1000)
         collectgarbage("collect")
 
+        local decode_opts = {bufferSize = 1024}
         local unexpected_errors = 0
         local file_iters = 0
         while mid_decode_file_calls == 0 and file_iters < 50 do
             file_iters = file_iters + 1
+            collectgarbage("stop")
             local batch = {}
             for i = 1, 200 do
                 batch[i] = make_gc_canary(gc_callback)
             end
             batch = nil
+            collectgarbage("restart")
             active_mode = "file"
-            local parsed_file = simdjson.parseFile(tmp_outer, {bufferSize = 1024})
+            local parsed_file = simdjson.parseFile(tmp_outer, decode_opts)
             active_mode = nil
             if #parsed_file ~= 400 or parsed_file[1].idx ~= 1 or parsed_file[400].idx ~= 400 then
                 unexpected_errors = unexpected_errors + 1
@@ -760,13 +763,15 @@ t:test("isolates active decoder state from reentrant parse and parseFile calls i
         local str_iters = 0
         while mid_decode_str_calls == 0 and str_iters < 50 do
             str_iters = str_iters + 1
+            collectgarbage("stop")
             local batch = {}
             for i = 1, 200 do
                 batch[i] = make_gc_canary(gc_callback)
             end
             batch = nil
+            collectgarbage("restart")
             active_mode = "str"
-            local parsed_str = simdjson.parse(outer_json, {bufferSize = 1024})
+            local parsed_str = simdjson.parse(outer_json, decode_opts)
             active_mode = nil
             if #parsed_str ~= 400 or parsed_str[1].idx ~= 1 or parsed_str[400].idx ~= 400 then
                 unexpected_errors = unexpected_errors + 1
