@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -128,11 +129,26 @@ static void shrink_decode_buffers(size_t desired_buffer_size,
       parse_buffer_capacity = 0;
     }
   }
-  if (ondemand_parser.capacity() > max_retained) {
+  if (ondemand_parser.capacity() > desired_buffer_size) {
     ondemand_parser = ondemand::parser{};
-    (void)ondemand_parser.allocate(desired_buffer_size,
-                                   static_cast<size_t>(max_depth));
+    if (ondemand_parser.allocate(desired_buffer_size,
+                                 static_cast<size_t>(max_depth)) !=
+        simdjson::SUCCESS) {
+      ondemand_parser = ondemand::parser{};
+    }
   }
+}
+
+static simdjson::error_code
+ensure_ondemand_parser_ready(size_t doc_len, size_t desired_buffer_size,
+                             int max_depth) noexcept {
+  size_t target_capacity = std::max(doc_len, desired_buffer_size);
+  size_t target_depth = static_cast<size_t>(max_depth);
+  if (ondemand_parser.capacity() < target_capacity ||
+      ondemand_parser.max_depth() < target_depth) {
+    return ondemand_parser.allocate(target_capacity, target_depth);
+  }
+  return simdjson::SUCCESS;
 }
 
 static int absolute_index(lua_State *L, int index) {
@@ -489,7 +505,8 @@ parse_value(lua_State *L, const char *json_str, size_t json_str_len,
     return {decode_status::input_too_large, simdjson::SUCCESS, 0};
   }
 
-  size_t required_capacity = json_str_len + SIMDJSON_PADDING;
+  size_t required_capacity =
+      std::max(json_str_len, desired_buffer_size) + SIMDJSON_PADDING;
   if (parse_buffer_capacity < required_capacity) {
     char *replacement = new (std::nothrow) char[required_capacity];
     if (replacement == nullptr) {
@@ -499,9 +516,18 @@ parse_value(lua_State *L, const char *json_str, size_t json_str_len,
     parse_buffer_capacity = required_capacity;
   }
 
-  std::memcpy(parse_buffer.get(), json_str, json_str_len);
+  if (json_str_len > 0) {
+    std::memcpy(parse_buffer.get(), json_str, json_str_len);
+  }
   simdjson::padded_string_view padded_view(parse_buffer.get(), json_str_len,
                                            parse_buffer_capacity);
+
+  if (auto error = ensure_ondemand_parser_ready(json_str_len,
+                                                desired_buffer_size, max_depth);
+      error) {
+    shrink_decode_buffers(desired_buffer_size, max_depth);
+    return {decode_status::simdjson_error, error, 0};
+  }
 
   ondemand::document doc;
   if (auto error = ondemand_parser.iterate(padded_view).get(doc); error) {
@@ -535,6 +561,13 @@ parse_file_value(lua_State *L, const char *json_file, size_t json_file_len,
 
   if (auto error =
           simdjson::padded_string::load(json_file).get(file_parse_buffer);
+      error) {
+    shrink_decode_buffers(desired_buffer_size, max_depth);
+    return {decode_status::simdjson_error, error, 0};
+  }
+
+  if (auto error = ensure_ondemand_parser_ready(file_parse_buffer.size(),
+                                                desired_buffer_size, max_depth);
       error) {
     shrink_decode_buffers(desired_buffer_size, max_depth);
     return {decode_status::simdjson_error, error, 0};
@@ -772,6 +805,9 @@ at_pointer_value(lua_State *L, ondemand::document *document,
     document->rewind();
     if (!convert_ondemand_element_to_table(L, *document, context)) {
       return {context.status, context.error, context.detail};
+    }
+    if (!document->at_end()) {
+      return {decode_status::simdjson_error, simdjson::TRAILING_CONTENT, 0};
     }
     return {decode_status::ok, simdjson::SUCCESS, 0};
   }

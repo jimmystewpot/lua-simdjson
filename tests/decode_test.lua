@@ -447,6 +447,28 @@ t:test("supports empty root JSON pointer on scalars, objects, and arrays", funct
     tested.assert({expected = simdjson.null, actual = simdjson.open("null"):atPointer("")})
     tested.assert({expected = 1, actual = simdjson.open('{"a":1}'):atPointer("").a})
     tested.assert({expected = {1, 2, 3}, actual = simdjson.open("[1,2,3]"):atPointer("")})
+
+    -- Empty root pointer must reject trailing content after root containers/scalars
+    for _, payload in ipairs({
+        '{"role":"user"}{"role":"admin"}',
+        '[1,2][3,4]',
+        '42 99',
+        'true false',
+    }) do
+        local doc = simdjson.open(payload)
+        local ok, err = pcall(function() return doc:atPointer("") end)
+        tested.assert({expected = false, actual = ok, message = "expected trailing content error for: " .. payload})
+        tested.assert_truthy({actual = err})
+    end
+
+    -- Raising maxDepth after a smaller shrink/re-prime must succeed on deep documents
+    simdjson.setDecodeBufferSize(256)
+    simdjson.setMaxDecodeDepth(4)
+    local large_shallow = '{"pad":"' .. string.rep("x", 4096) .. '"}'
+    tested.assert({expected = 4096, actual = #simdjson.parse(large_shallow).pad})
+    local nested_12 = string.rep("[", 12) .. "1" .. string.rep("]", 12)
+    local decoded_12 = simdjson.parse(nested_12, {maxDepth = 16})
+    tested.assert({expected = "table", actual = type(decoded_12)})
 end)
 
 t:test("rejects invalid open, openFile, and atPointer inputs and enforces maxDepth on atPointer", function()
