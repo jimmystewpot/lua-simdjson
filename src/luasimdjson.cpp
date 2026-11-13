@@ -635,12 +635,8 @@ static int get_decode_buffer_size(lua_State *L) {
 
 static int active_implementation(lua_State *L) {
   const auto &implementation = simdjson::get_active_implementation();
-  std::string name = implementation->name();
-  const std::string description = implementation->description();
-  const std::string implementation_name = name + " (" + description + ")";
-
-  lua_pushlstring(L, implementation_name.data(), implementation_name.size());
-
+  lua_pushfstring(L, "%s (%s)", implementation->name().c_str(),
+                  implementation->description().c_str());
   return 1;
 }
 
@@ -652,65 +648,158 @@ private:
   ondemand::document doc;
   std::unique_ptr<ondemand::parser> parser;
 
+  ParsedObject() = default;
+
 public:
-  ParsedObject(const char *json_file)
-      : json_string(padded_string::load(json_file)),
-        parser(new ondemand::parser{}) {
-    this->doc = this->parser.get()->iterate(json_string);
-  }
-  ParsedObject(const char *json_str, size_t json_str_len)
-      : json_string(json_str, json_str_len), parser(new ondemand::parser{}) {
-    this->doc = this->parser.get()->iterate(json_string);
-  }
-  ~ParsedObject() {}
+  ~ParsedObject() = default;
   ondemand::document *get_doc() { return &(this->doc); }
+
+  static LUA_SIMDJSON_NOINLINE decode_outcome create_from_string(
+      const char *json_str, size_t json_str_len, ParsedObject **out) noexcept {
+    *out = nullptr;
+    if (json_str_len > std::numeric_limits<size_t>::max() - SIMDJSON_PADDING) {
+      return {decode_status::input_too_large, simdjson::SUCCESS, 0};
+    }
+
+    std::unique_ptr<ParsedObject> obj(new (std::nothrow) ParsedObject());
+    if (!obj) {
+      return {decode_status::allocation_failed, simdjson::SUCCESS, 0};
+    }
+
+    obj->parser.reset(new (std::nothrow) ondemand::parser{});
+    if (!obj->parser) {
+      return {decode_status::allocation_failed, simdjson::SUCCESS, 0};
+    }
+
+    obj->json_string = simdjson::padded_string(json_str, json_str_len);
+    if (obj->json_string.data() == nullptr) {
+      return {decode_status::allocation_failed, simdjson::SUCCESS, 0};
+    }
+
+    if (auto error = obj->parser->iterate(obj->json_string).get(obj->doc);
+        error) {
+      return {decode_status::simdjson_error, error, 0};
+    }
+
+    *out = obj.release();
+    return {decode_status::ok, simdjson::SUCCESS, 0};
+  }
+
+  static LUA_SIMDJSON_NOINLINE decode_outcome
+  create_from_file(const char *json_file, size_t json_file_len,
+                   ParsedObject **out) noexcept {
+    *out = nullptr;
+    if (std::memchr(json_file, '\0', json_file_len) != nullptr) {
+      return {decode_status::simdjson_error, simdjson::IO_ERROR, 0};
+    }
+
+    std::unique_ptr<ParsedObject> obj(new (std::nothrow) ParsedObject());
+    if (!obj) {
+      return {decode_status::allocation_failed, simdjson::SUCCESS, 0};
+    }
+
+    obj->parser.reset(new (std::nothrow) ondemand::parser{});
+    if (!obj->parser) {
+      return {decode_status::allocation_failed, simdjson::SUCCESS, 0};
+    }
+
+    if (auto error =
+            simdjson::padded_string::load(json_file).get(obj->json_string);
+        error) {
+      return {decode_status::simdjson_error, error, 0};
+    }
+
+    if (auto error = obj->parser->iterate(obj->json_string).get(obj->doc);
+        error) {
+      return {decode_status::simdjson_error, error, 0};
+    }
+
+    *out = obj.release();
+    return {decode_status::ok, simdjson::SUCCESS, 0};
+  }
 };
 
 static int ParsedObject_delete(lua_State *L) {
-  delete *reinterpret_cast<ParsedObject **>(lua_touserdata(L, 1));
+  ParsedObject **slot = reinterpret_cast<ParsedObject **>(lua_touserdata(L, 1));
+  if (slot != nullptr && *slot != nullptr) {
+    delete *slot;
+    *slot = nullptr;
+  }
   return 0;
 }
 
 static int ParsedObject_open(lua_State *L) {
-  size_t json_str_len;
+  size_t json_str_len = 0;
   const char *json_str = luaL_checklstring(L, 1, &json_str_len);
 
-  try {
-    ParsedObject **parsedObject =
-        (ParsedObject **)(lua_newuserdata(L, sizeof(ParsedObject *)));
-    *parsedObject = new ParsedObject(json_str, json_str_len);
-    luaL_getmetatable(L, LUA_MYOBJECT);
-    lua_setmetatable(L, -2);
-  } catch (simdjson::simdjson_error &error) {
-    luaL_error(L, error.what());
+  ParsedObject **slot = reinterpret_cast<ParsedObject **>(
+      lua_newuserdata(L, sizeof(ParsedObject *)));
+  *slot = nullptr;
+  luaL_getmetatable(L, LUA_MYOBJECT);
+  lua_setmetatable(L, -2);
+
+  decode_outcome outcome =
+      ParsedObject::create_from_string(json_str, json_str_len, slot);
+  if (outcome.status != decode_status::ok) {
+    return raise_decode_error(L, outcome);
   }
   return 1;
 }
 
 static int ParsedObject_open_file(lua_State *L) {
-  const char *json_file = luaL_checkstring(L, 1);
+  size_t json_file_len = 0;
+  const char *json_file = luaL_checklstring(L, 1, &json_file_len);
 
-  try {
-    ParsedObject **parsedObject =
-        (ParsedObject **)(lua_newuserdata(L, sizeof(ParsedObject *)));
-    *parsedObject = new ParsedObject(json_file);
-    luaL_getmetatable(L, LUA_MYOBJECT);
-    lua_setmetatable(L, -2);
-  } catch (simdjson::simdjson_error &error) {
-    luaL_error(L, error.what());
+  ParsedObject **slot = reinterpret_cast<ParsedObject **>(
+      lua_newuserdata(L, sizeof(ParsedObject *)));
+  *slot = nullptr;
+  luaL_getmetatable(L, LUA_MYOBJECT);
+  lua_setmetatable(L, -2);
+
+  decode_outcome outcome =
+      ParsedObject::create_from_file(json_file, json_file_len, slot);
+  if (outcome.status != decode_status::ok) {
+    return raise_decode_error(L, outcome);
+  }
+  return 1;
+}
+
+static LUA_SIMDJSON_NOINLINE decode_outcome
+at_pointer_value(lua_State *L, ondemand::document *document,
+                 const char *pointer, size_t pointer_len, int max_depth) {
+  decode_context context{max_depth};
+  if (pointer_len == 0) {
+    document->rewind();
+    if (!convert_ondemand_element_to_table(L, *document, context)) {
+      return {context.status, context.error, context.detail};
+    }
+    return {decode_status::ok, simdjson::SUCCESS, 0};
   }
 
-  return 1;
+  ondemand::value returned_element;
+  if (auto error = document->at_pointer(std::string_view(pointer, pointer_len))
+                       .get(returned_element);
+      error) {
+    return {decode_status::simdjson_error, error, 0};
+  }
+  if (!convert_ondemand_element_to_table(L, returned_element, context)) {
+    return {context.status, context.error, context.detail};
+  }
+  return {decode_status::ok, simdjson::SUCCESS, 0};
 }
 
 static int ParsedObject_atPointer(lua_State *L) {
   int argument_count = lua_gettop(L);
   luaL_argcheck(L, argument_count >= 2 && argument_count <= 3, 2,
                 "expected 2 or 3 arguments");
-  ondemand::document *document =
-      (*reinterpret_cast<ParsedObject **>(luaL_checkudata(L, 1, LUA_MYOBJECT)))
-          ->get_doc();
-  const char *pointer = luaL_checkstring(L, 2);
+  ParsedObject **slot =
+      reinterpret_cast<ParsedObject **>(luaL_checkudata(L, 1, LUA_MYOBJECT));
+  if (slot == nullptr || *slot == nullptr) {
+    return luaL_error(L, "invalid ParsedObject");
+  }
+  ondemand::document *document = (*slot)->get_doc();
+  size_t pointer_len = 0;
+  const char *pointer = luaL_checklstring(L, 2, &pointer_len);
 
   int max_depth = read_max_decode_depth(L);
   size_t desired_buffer_size = read_decode_buffer_size(L);
@@ -721,17 +810,11 @@ static int ParsedObject_atPointer(lua_State *L) {
   (void)desired_buffer_size;
 
   const int initial_top = lua_gettop(L);
-  try {
-    ondemand::value returned_element = document->at_pointer(pointer);
-    decode_context context{max_depth};
-    if (!convert_ondemand_element_to_table(L, returned_element, context)) {
-      lua_settop(L, initial_top);
-      return raise_decode_error(
-          L, {context.status, context.error, context.detail});
-    }
-  } catch (simdjson::simdjson_error &error) {
+  decode_outcome outcome =
+      at_pointer_value(L, document, pointer, pointer_len, max_depth);
+  if (outcome.status != decode_status::ok) {
     lua_settop(L, initial_top);
-    luaL_error(L, error.what());
+    return raise_decode_error(L, outcome);
   }
 
   return 1;

@@ -429,4 +429,119 @@ t:test("does not leak memory across repeated parse and parseFile errors", functi
     end
 end)
 
+t:test("supports empty root JSON pointer on scalars, objects, and arrays", function()
+    local impl = simdjson.activeImplementation()
+    tested.assert({expected = "string", actual = type(impl)})
+    tested.assert({
+        expected = true,
+        actual = impl:match("^.+ %(.+%)$") ~= nil,
+        message = "unexpected activeImplementation format: " .. tostring(impl),
+    })
+
+    local num_doc = simdjson.open("42")
+    tested.assert({expected = 42, actual = num_doc:atPointer("")})
+    tested.assert({expected = 42, actual = num_doc:atPointer("")})
+
+    tested.assert({expected = "hello", actual = simdjson.open('"hello"'):atPointer("")})
+    tested.assert({expected = true, actual = simdjson.open("true"):atPointer("")})
+    tested.assert({expected = simdjson.null, actual = simdjson.open("null"):atPointer("")})
+    tested.assert({expected = 1, actual = simdjson.open('{"a":1}'):atPointer("").a})
+    tested.assert({expected = {1, 2, 3}, actual = simdjson.open("[1,2,3]"):atPointer("")})
+end)
+
+t:test("rejects invalid open, openFile, and atPointer inputs and enforces maxDepth on atPointer", function()
+    local decoded = simdjson.openFile("jsonexamples/small/demo.json")
+    local deep_doc = simdjson.open('{"deep":{"a":{"b":{"c":1}}}}')
+
+    for _, call in ipairs({
+        function() return simdjson.open('{"a":"unterminated}') end,
+        function() return simdjson.openFile("jsonexamples/invalid/does_not_exist.json") end,
+        function() return simdjson.openFile("jsonexamples/small/demo.json\0extra") end,
+        function() return decoded:atPointer("/missing") end,
+        function() return decoded:atPointer("/Image/IDs/99") end,
+        function() return decoded:atPointer("no_leading_slash") end,
+        function() return decoded:atPointer("/Image/Width/sub") end,
+    }) do
+        local n_ret = select("#", pcall(call))
+        tested.assert({expected = 2, actual = n_ret})
+        local ok, err = pcall(call)
+        tested.assert({expected = false, actual = ok})
+        tested.assert_truthy({actual = err})
+    end
+
+    local ok_deep, err_deep = pcall(function()
+        return deep_doc:atPointer("/deep", {maxDepth = 2})
+    end)
+    tested.assert({expected = false, actual = ok_deep})
+    tested.assert({
+        expected = true,
+        actual = tostring(err_deep):find("maximum nesting depth exceeded (limit: 2)", 1, true) ~= nil,
+        message = tostring(err_deep),
+    })
+
+    tested.assert({
+        expected = {a = {b = {c = 1}}},
+        actual = deep_doc:atPointer("/deep", {maxDepth = 3}),
+    })
+end)
+
+t:test("does not leak memory across repeated open, openFile, and atPointer errors", function()
+    local padding = string.rep("x", 10 * 1024)
+    local invalid_open = '{"pad":"' .. padding .. '", "bad": "unterminated}'
+    local decoded = simdjson.openFile("jsonexamples/small/demo.json")
+    local deep_doc = simdjson.open('{"deep":{"a":{"b":{"c":1}}}}')
+
+    for _ = 1, 100 do
+        pcall(simdjson.open, invalid_open)
+        pcall(simdjson.openFile, "jsonexamples/invalid/does_not_exist.json")
+        pcall(simdjson.openFile, "jsonexamples/small/demo.json\0extra")
+        pcall(decoded.atPointer, decoded, "/missing")
+        pcall(decoded.atPointer, decoded, "/Image/IDs/99")
+        pcall(decoded.atPointer, decoded, "no_leading_slash")
+        pcall(decoded.atPointer, decoded, "/Image/Width/sub")
+        pcall(deep_doc.atPointer, deep_doc, "/deep", {maxDepth = 2})
+        simdjson.activeImplementation()
+    end
+    collectgarbage("collect")
+    collectgarbage("collect")
+    local rss_before = get_rss_kb()
+
+    for _ = 1, 5000 do
+        local ok1 = pcall(simdjson.open, invalid_open)
+        tested.assert({expected = false, actual = ok1})
+
+        local ok2 = pcall(simdjson.openFile, "jsonexamples/invalid/does_not_exist.json")
+        tested.assert({expected = false, actual = ok2})
+
+        local ok3 = pcall( decoded.atPointer, decoded, "/missing")
+        tested.assert({expected = false, actual = ok3})
+
+        local ok4 = pcall(decoded.atPointer, decoded, "/Image/IDs/99")
+        tested.assert({expected = false, actual = ok4})
+
+        local ok5 = pcall(decoded.atPointer, decoded, "no_leading_slash")
+        tested.assert({expected = false, actual = ok5})
+
+        local ok6 = pcall(deep_doc.atPointer, deep_doc, "/deep", {maxDepth = 2})
+        tested.assert({expected = false, actual = ok6})
+
+        simdjson.activeImplementation()
+    end
+
+    collectgarbage("collect")
+    collectgarbage("collect")
+    local rss_after = get_rss_kb()
+    local rss_delta = rss_after - rss_before
+    tested.assert({
+        expected = true,
+        actual = rss_delta < 2048,
+        message = string.format(
+            "expected open/openFile/atPointer error-path RSS growth < 2048 KiB, got %d KiB (before=%d, after=%d)",
+            rss_delta,
+            rss_before,
+            rss_after
+        ),
+    })
+end)
+
 return t
