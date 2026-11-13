@@ -341,23 +341,53 @@ t:test("shrinks oversized decode buffers back to bufferSize after large valid or
         f_invalid:write(big_invalid)
         f_invalid:close()
 
+        -- Verify retained vs released native buffer capacities directly
+        local retained_parsed = simdjson.parse(big_valid, {bufferSize = 5 * 1024 * 1024})
+        tested.assert({expected = payload_size, actual = #retained_parsed.data})
+        retained_parsed = nil
+        local caps_retained = simdjson._debugDecodeCapacities()
+        tested.assert({expected = true, actual = caps_retained.parseBuffer >= 5 * 1024 * 1024})
+        tested.assert({expected = 0, actual = caps_retained.fileBuffer})
+        tested.assert({expected = true, actual = caps_retained.parserCapacity >= 5 * 1024 * 1024})
+
         for _ = 1, 3 do
             local warmup_parsed = simdjson.parse(big_valid, {bufferSize = 16384})
             assert(#warmup_parsed.data == payload_size)
             warmup_parsed = nil
+            local caps_after_parse = simdjson._debugDecodeCapacities()
+            tested.assert({expected = 0, actual = caps_after_parse.parseBuffer})
+            tested.assert({expected = 0, actual = caps_after_parse.fileBuffer})
+            tested.assert({expected = 0, actual = caps_after_parse.parserCapacity})
             collectgarbage("collect")
 
             local warmup_file = simdjson.parseFile(tmp_valid, {bufferSize = 16384})
             assert(#warmup_file.data == payload_size)
             warmup_file = nil
+            local caps_after_file = simdjson._debugDecodeCapacities()
+            tested.assert({expected = 0, actual = caps_after_file.parseBuffer})
+            tested.assert({expected = 0, actual = caps_after_file.fileBuffer})
+            tested.assert({expected = 0, actual = caps_after_file.parserCapacity})
             collectgarbage("collect")
 
             pcall(simdjson.parse, big_invalid, {bufferSize = 16384})
+            local caps_after_bad_parse = simdjson._debugDecodeCapacities()
+            tested.assert({expected = 0, actual = caps_after_bad_parse.parseBuffer})
+            tested.assert({expected = 0, actual = caps_after_bad_parse.fileBuffer})
+            tested.assert({expected = 0, actual = caps_after_bad_parse.parserCapacity})
+
             pcall(simdjson.parseFile, tmp_invalid, {bufferSize = 16384})
+            local caps_after_bad_file = simdjson._debugDecodeCapacities()
+            tested.assert({expected = 0, actual = caps_after_bad_file.parseBuffer})
+            tested.assert({expected = 0, actual = caps_after_bad_file.fileBuffer})
+            tested.assert({expected = 0, actual = caps_after_bad_file.parserCapacity})
         end
         for _ = 1, 20 do
             simdjson.parse('{"warmup":1}', {bufferSize = 16384})
         end
+        local caps_primed = simdjson._debugDecodeCapacities()
+        tested.assert({expected = 16384 + 64, actual = caps_primed.parseBuffer})
+        tested.assert({expected = 0, actual = caps_primed.fileBuffer})
+        tested.assert({expected = 16384, actual = caps_primed.parserCapacity})
         collectgarbage("collect")
         collectgarbage("collect")
         local rss_before = get_rss_kb()
@@ -655,6 +685,87 @@ t:test("does not leak memory across repeated open, openFile, and atPointer error
                 rss_after
             ),
         })
+    end
+end)
+
+t:test("isolates active decoder state from reentrant parse and parseFile calls in __gc finalizers", function()
+    local newproxy_fn = rawget(_G, "newproxy")
+    local function make_gc_canary(callback)
+        if newproxy_fn then
+            local proxy = newproxy_fn(true)
+            getmetatable(proxy).__gc = callback
+            return proxy
+        end
+        return setmetatable({}, {__gc = callback})
+    end
+
+    local items = {}
+    for i = 1, 400 do
+        items[i] = string.format('{"idx":%d,"label":"item_%04d_%s"}', i, i, string.rep("z", 64))
+    end
+    local outer_json = "[" .. table.concat(items, ",") .. "]"
+    local tmp_outer = make_temp_path()
+
+    local ok_run, run_err = pcall(function()
+        local f = assert(io.open(tmp_outer, "wb"))
+        f:write(outer_json)
+        f:close()
+
+        local reentrant_calls = 0
+        local mid_decode_calls = 0
+        local function gc_callback()
+            reentrant_calls = reentrant_calls + 1
+            if simdjson._debugDecodeCapacities().inUse then
+                mid_decode_calls = mid_decode_calls + 1
+            end
+            local ok_missing = pcall(simdjson.parseFile, "jsonexamples/invalid/does_not_exist.json")
+            assert(not ok_missing)
+            local small_file = simdjson.parseFile("jsonexamples/small/demo.json", {bufferSize = 64})
+            assert(small_file.Image.Width == 800)
+            local ok_bad = pcall(simdjson.parse, '{"bad": nil}', {bufferSize = 64})
+            assert(not ok_bad)
+            local small_str = simdjson.parse('{"nested":42}', {bufferSize = 64})
+            assert(small_str.nested == 42)
+        end
+
+        collectgarbage("collect")
+        local ok_pause, old_pause = pcall(collectgarbage, "setpause", 60)
+        local ok_step, old_step = pcall(collectgarbage, "setstepmul", 400)
+        for _ = 1, 5 do
+            local batch = {}
+            for i = 1, 200 do
+                batch[i] = make_gc_canary(gc_callback)
+            end
+            batch = nil -- make unreachable right before outer parseFile/parse
+            local parsed_file = simdjson.parseFile(tmp_outer, {bufferSize = 1024})
+            tested.assert({expected = 400, actual = #parsed_file})
+            tested.assert({expected = 1, actual = parsed_file[1].idx})
+            tested.assert({expected = 400, actual = parsed_file[400].idx})
+
+            batch = {}
+            for i = 1, 200 do
+                batch[i] = make_gc_canary(gc_callback)
+            end
+            batch = nil
+            local parsed_str = simdjson.parse(outer_json, {bufferSize = 1024})
+            tested.assert({expected = 400, actual = #parsed_str})
+            tested.assert({expected = 1, actual = parsed_str[1].idx})
+            tested.assert({expected = 400, actual = parsed_str[400].idx})
+        end
+        if ok_pause and type(old_pause) == "number" and old_pause > 0 then
+            pcall(collectgarbage, "setpause", old_pause)
+        end
+        if ok_step and type(old_step) == "number" and old_step > 0 then
+            pcall(collectgarbage, "setstepmul", old_step)
+        end
+        collectgarbage("collect")
+        tested.assert({expected = true, actual = reentrant_calls > 0})
+        tested.assert({expected = true, actual = mid_decode_calls > 0})
+    end)
+
+    os.remove(tmp_outer)
+    if not ok_run then
+        error(run_err, 0)
     end
 end)
 

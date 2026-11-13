@@ -18,6 +18,7 @@ static int set_max_decode_depth(lua_State *);
 static int get_max_decode_depth(lua_State *);
 static int set_decode_buffer_size(lua_State *);
 static int get_decode_buffer_size(lua_State *);
+static int debug_decode_capacities(lua_State *);
 static const struct luaL_Reg luasimdjson[] = {
     {"parse", parse},
     {"parseFile", parse_file},
@@ -28,6 +29,7 @@ static const struct luaL_Reg luasimdjson[] = {
     {"getMaxDecodeDepth", get_max_decode_depth},
     {"setDecodeBufferSize", set_decode_buffer_size},
     {"getDecodeBufferSize", get_decode_buffer_size},
+    {"_debugDecodeCapacities", debug_decode_capacities},
     {"encode", encode},
     {"setMaxEncodeDepth", set_max_encode_depth},
     {"getMaxEncodeDepth", get_max_encode_depth},
