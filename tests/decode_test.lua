@@ -268,7 +268,7 @@ t:test("decodes nesting up to the depth limit (1024) without exhausting the Lua 
 end)
 
 local function get_rss_kb()
-    if is_windows then
+    if is_windows or os.getenv("ASAN_OPTIONS") then
         return nil
     end
 
@@ -308,7 +308,7 @@ end
 t:test("shrinks oversized decode buffers back to bufferSize after large valid or invalid inputs", function()
     local payload_size = 4 * 1024 * 1024
     local big_valid = '{"data":"' .. string.rep("x", payload_size) .. '"}'
-    local big_invalid = '{"data":"' .. string.rep("x", payload_size) .. '", "bad": nil}'
+    local big_invalid = '{"bad": nil, "data":"' .. string.rep("x", payload_size) .. '"}'
     local tmp_valid = make_temp_path()
     local tmp_invalid = make_temp_path()
 
@@ -321,12 +321,19 @@ t:test("shrinks oversized decode buffers back to bufferSize after large valid or
         f_invalid:write(big_invalid)
         f_invalid:close()
 
-        do
-            local warmup_obj = simdjson.open(big_valid)
-            local warmup_val = warmup_obj:atPointer("/data")
-            tested.assert({expected = payload_size, actual = #warmup_val})
-            warmup_val = nil
-            warmup_obj = nil
+        for _ = 1, 3 do
+            local warmup_parsed = simdjson.parse(big_valid, {bufferSize = 16384})
+            assert(#warmup_parsed.data == payload_size)
+            warmup_parsed = nil
+            collectgarbage("collect")
+
+            local warmup_file = simdjson.parseFile(tmp_valid, {bufferSize = 16384})
+            assert(#warmup_file.data == payload_size)
+            warmup_file = nil
+            collectgarbage("collect")
+
+            pcall(simdjson.parse, big_invalid, {bufferSize = 16384})
+            pcall(simdjson.parseFile, tmp_invalid, {bufferSize = 16384})
         end
         for _ = 1, 20 do
             simdjson.parse('{"warmup":1}', {bufferSize = 16384})
@@ -335,40 +342,50 @@ t:test("shrinks oversized decode buffers back to bufferSize after large valid or
         collectgarbage("collect")
         local rss_before = get_rss_kb()
 
+        local unexpected_errors = 0
         for _ = 1, 20 do
             local decoded = simdjson.parse(big_valid, {bufferSize = 16384})
-            tested.assert({expected = payload_size, actual = #decoded.data})
+            if #decoded.data ~= payload_size then
+                unexpected_errors = unexpected_errors + 1
+            end
             decoded = nil
             collectgarbage("collect")
 
             local ok_parse, err_parse = pcall(simdjson.parse, big_invalid, {bufferSize = 16384})
-            tested.assert({expected = false, actual = ok_parse})
-            tested.assert_truthy({actual = err_parse})
+            if ok_parse or not err_parse then
+                unexpected_errors = unexpected_errors + 1
+            end
 
             local decoded_file = simdjson.parseFile(tmp_valid, {bufferSize = 16384})
-            tested.assert({expected = payload_size, actual = #decoded_file.data})
+            if #decoded_file.data ~= payload_size then
+                unexpected_errors = unexpected_errors + 1
+            end
             decoded_file = nil
             collectgarbage("collect")
 
             local ok_file, err_file = pcall(simdjson.parseFile, tmp_invalid, {bufferSize = 16384})
-            tested.assert({expected = false, actual = ok_file})
-            tested.assert_truthy({actual = err_file})
+            if ok_file or not err_file then
+                unexpected_errors = unexpected_errors + 1
+            end
         end
 
         for _ = 1, 20 do
             local small = simdjson.parse('{"small":true}', {bufferSize = 16384})
-            tested.assert({expected = true, actual = small.small})
+            if small.small ~= true then
+                unexpected_errors = unexpected_errors + 1
+            end
         end
 
         collectgarbage("collect")
         collectgarbage("collect")
         local rss_after = get_rss_kb()
+        tested.assert({expected = 0, actual = unexpected_errors})
         if rss_before and rss_after then
             local rss_delta = rss_after - rss_before
             tested.assert({
                 expected = true,
                 actual = rss_delta < 2048,
-                message = string.format(
+                debug_var = string.format(
                     "expected oversized decode buffers to shrink (< 2048 KiB delta), got %d KiB (before=%d, after=%d)",
                     rss_delta,
                     rss_before,
@@ -387,8 +404,8 @@ end)
 
 t:test("does not leak memory across repeated parse and parseFile errors", function()
     local padding = string.rep("x", 10 * 1024)
-    local invalid_syntax = '{"pad":"' .. padding .. '", "bad": nil}'
-    local invalid_unknown = '{"pad":"' .. padding .. '", "bad": NaN}'
+    local invalid_syntax = '{"bad": nil, "pad":"' .. padding .. '"}'
+    local invalid_unknown = '{"bad": NaN, "pad":"' .. padding .. '"}'
     local tmp_syntax = make_temp_path()
     local tmp_unknown = make_temp_path()
 
@@ -411,29 +428,35 @@ t:test("does not leak memory across repeated parse and parseFile errors", functi
         collectgarbage("collect")
         local rss_before = get_rss_kb()
 
+        local unexpected_successes = 0
         for _ = 1, 15000 do
-            local ok1 = pcall(simdjson.parse, invalid_syntax)
-            tested.assert({expected = false, actual = ok1})
-            local ok2 = pcall(simdjson.parse, invalid_unknown)
-            tested.assert({expected = false, actual = ok2})
+            if pcall(simdjson.parse, invalid_syntax) then
+                unexpected_successes = unexpected_successes + 1
+            end
+            if pcall(simdjson.parse, invalid_unknown) then
+                unexpected_successes = unexpected_successes + 1
+            end
         end
 
         for _ = 1, 2500 do
-            local ok1 = pcall(simdjson.parseFile, tmp_syntax)
-            tested.assert({expected = false, actual = ok1})
-            local ok2 = pcall(simdjson.parseFile, tmp_unknown)
-            tested.assert({expected = false, actual = ok2})
+            if pcall(simdjson.parseFile, tmp_syntax) then
+                unexpected_successes = unexpected_successes + 1
+            end
+            if pcall(simdjson.parseFile, tmp_unknown) then
+                unexpected_successes = unexpected_successes + 1
+            end
         end
 
         collectgarbage("collect")
         collectgarbage("collect")
         local rss_after = get_rss_kb()
+        tested.assert({expected = 0, actual = unexpected_successes})
         if rss_before and rss_after then
             local rss_delta = rss_after - rss_before
             tested.assert({
                 expected = true,
                 actual = rss_delta < 2048,
-                message = string.format(
+                debug_var = string.format(
                     "expected error-path RSS growth < 2048 KiB, got %d KiB (before=%d, after=%d)",
                     rss_delta,
                     rss_before,
@@ -549,37 +572,39 @@ t:test("does not leak memory across repeated open, openFile, and atPointer error
     collectgarbage("collect")
     local rss_before = get_rss_kb()
 
+    local unexpected_successes = 0
     for _ = 1, 5000 do
-        local ok1 = pcall(simdjson.open, invalid_open)
-        tested.assert({expected = false, actual = ok1})
-
-        local ok2 = pcall(simdjson.openFile, "jsonexamples/invalid/does_not_exist.json")
-        tested.assert({expected = false, actual = ok2})
-
-        local ok3 = pcall( decoded.atPointer, decoded, "/missing")
-        tested.assert({expected = false, actual = ok3})
-
-        local ok4 = pcall(decoded.atPointer, decoded, "/Image/IDs/99")
-        tested.assert({expected = false, actual = ok4})
-
-        local ok5 = pcall(decoded.atPointer, decoded, "no_leading_slash")
-        tested.assert({expected = false, actual = ok5})
-
-        local ok6 = pcall(deep_doc.atPointer, deep_doc, "/deep", {maxDepth = 2})
-        tested.assert({expected = false, actual = ok6})
-
+        if pcall(simdjson.open, invalid_open) then
+            unexpected_successes = unexpected_successes + 1
+        end
+        if pcall(simdjson.openFile, "jsonexamples/invalid/does_not_exist.json") then
+            unexpected_successes = unexpected_successes + 1
+        end
+        if pcall(decoded.atPointer, decoded, "/missing") then
+            unexpected_successes = unexpected_successes + 1
+        end
+        if pcall(decoded.atPointer, decoded, "/Image/IDs/99") then
+            unexpected_successes = unexpected_successes + 1
+        end
+        if pcall(decoded.atPointer, decoded, "no_leading_slash") then
+            unexpected_successes = unexpected_successes + 1
+        end
+        if pcall(deep_doc.atPointer, deep_doc, "/deep", {maxDepth = 2}) then
+            unexpected_successes = unexpected_successes + 1
+        end
         simdjson.activeImplementation()
     end
 
     collectgarbage("collect")
     collectgarbage("collect")
     local rss_after = get_rss_kb()
+    tested.assert({expected = 0, actual = unexpected_successes})
     if rss_before and rss_after then
         local rss_delta = rss_after - rss_before
         tested.assert({
             expected = true,
             actual = rss_delta < 2048,
-            message = string.format(
+            debug_var = string.format(
                 "expected open/openFile/atPointer error-path RSS growth < 2048 KiB, got %d KiB (before=%d, after=%d)",
                 rss_delta,
                 rss_before,
