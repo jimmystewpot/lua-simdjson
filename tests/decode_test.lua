@@ -254,4 +254,179 @@ t:test("decodes nesting up to the depth limit (1024) without exhausting the Lua 
     })
 end)
 
+local function get_rss_kb()
+    local status_file = io.open("/proc/self/status", "r")
+    if status_file then
+        local content = status_file:read("*all")
+        status_file:close()
+        local vm_rss = content:match("VmRSS:%s*(%d+)%s*kB")
+        if vm_rss then
+            return tonumber(vm_rss)
+        end
+    end
+
+    local statm_file = io.open("/proc/self/statm", "r")
+    if statm_file then
+        local content = statm_file:read("*all")
+        statm_file:close()
+        local resident_pages = content:match("^%d+%s+(%d+)")
+        if resident_pages then
+            return tonumber(resident_pages) * 4
+        end
+    end
+
+    local pipe = io.popen('sh -c "ps -o rss= -p $PPID"')
+    if pipe then
+        local output = pipe:read("*all")
+        pipe:close()
+        local rss = tonumber(output)
+        if rss then
+            return rss
+        end
+    end
+
+    error("unable to determine process RSS")
+end
+
+t:test("shrinks oversized decode buffers back to bufferSize after large valid or invalid inputs", function()
+    local payload_size = 4 * 1024 * 1024
+    local big_valid = '{"data":"' .. string.rep("x", payload_size) .. '"}'
+    local big_invalid = '{"data":"' .. string.rep("x", payload_size) .. '", "bad": nil}'
+    local tmp_valid = os.tmpname()
+    local tmp_invalid = os.tmpname()
+
+    local ok_run, run_err = pcall(function()
+        local f_valid = assert(io.open(tmp_valid, "wb"))
+        f_valid:write(big_valid)
+        f_valid:close()
+
+        local f_invalid = assert(io.open(tmp_invalid, "wb"))
+        f_invalid:write(big_invalid)
+        f_invalid:close()
+
+        do
+            local warmup_obj = simdjson.open(big_valid)
+            local warmup_val = warmup_obj:atPointer("/data")
+            tested.assert({expected = payload_size, actual = #warmup_val})
+            warmup_val = nil
+            warmup_obj = nil
+        end
+        for _ = 1, 20 do
+            simdjson.parse('{"warmup":1}', {bufferSize = 16384})
+        end
+        collectgarbage("collect")
+        collectgarbage("collect")
+        local rss_before = get_rss_kb()
+
+        for _ = 1, 20 do
+            local decoded = simdjson.parse(big_valid, {bufferSize = 16384})
+            tested.assert({expected = payload_size, actual = #decoded.data})
+            decoded = nil
+            collectgarbage("collect")
+
+            local ok_parse, err_parse = pcall(simdjson.parse, big_invalid, {bufferSize = 16384})
+            tested.assert({expected = false, actual = ok_parse})
+            tested.assert_truthy({actual = err_parse})
+
+            local decoded_file = simdjson.parseFile(tmp_valid, {bufferSize = 16384})
+            tested.assert({expected = payload_size, actual = #decoded_file.data})
+            decoded_file = nil
+            collectgarbage("collect")
+
+            local ok_file, err_file = pcall(simdjson.parseFile, tmp_invalid, {bufferSize = 16384})
+            tested.assert({expected = false, actual = ok_file})
+            tested.assert_truthy({actual = err_file})
+        end
+
+        for _ = 1, 20 do
+            local small = simdjson.parse('{"small":true}', {bufferSize = 16384})
+            tested.assert({expected = true, actual = small.small})
+        end
+
+        collectgarbage("collect")
+        collectgarbage("collect")
+        local rss_after = get_rss_kb()
+        local rss_delta = rss_after - rss_before
+        tested.assert({
+            expected = true,
+            actual = rss_delta < 2048,
+            message = string.format(
+                "expected oversized decode buffers to shrink (< 2048 KiB delta), got %d KiB (before=%d, after=%d)",
+                rss_delta,
+                rss_before,
+                rss_after
+            ),
+        })
+    end)
+
+    os.remove(tmp_valid)
+    os.remove(tmp_invalid)
+    if not ok_run then
+        error(run_err, 0)
+    end
+end)
+
+t:test("does not leak memory across repeated parse and parseFile errors", function()
+    local padding = string.rep("x", 10 * 1024)
+    local invalid_syntax = '{"pad":"' .. padding .. '", "bad": nil}'
+    local invalid_unknown = '{"pad":"' .. padding .. '", "bad": NaN}'
+    local tmp_syntax = os.tmpname()
+    local tmp_unknown = os.tmpname()
+
+    local ok_run, run_err = pcall(function()
+        local f_syntax = assert(io.open(tmp_syntax, "wb"))
+        f_syntax:write(invalid_syntax)
+        f_syntax:close()
+
+        local f_unknown = assert(io.open(tmp_unknown, "wb"))
+        f_unknown:write(invalid_unknown)
+        f_unknown:close()
+
+        for _ = 1, 100 do
+            pcall(simdjson.parse, invalid_syntax)
+            pcall(simdjson.parse, invalid_unknown)
+            pcall(simdjson.parseFile, tmp_syntax)
+            pcall(simdjson.parseFile, tmp_unknown)
+        end
+        collectgarbage("collect")
+        collectgarbage("collect")
+        local rss_before = get_rss_kb()
+
+        for _ = 1, 15000 do
+            local ok1 = pcall(simdjson.parse, invalid_syntax)
+            tested.assert({expected = false, actual = ok1})
+            local ok2 = pcall(simdjson.parse, invalid_unknown)
+            tested.assert({expected = false, actual = ok2})
+        end
+
+        for _ = 1, 2500 do
+            local ok1 = pcall(simdjson.parseFile, tmp_syntax)
+            tested.assert({expected = false, actual = ok1})
+            local ok2 = pcall(simdjson.parseFile, tmp_unknown)
+            tested.assert({expected = false, actual = ok2})
+        end
+
+        collectgarbage("collect")
+        collectgarbage("collect")
+        local rss_after = get_rss_kb()
+        local rss_delta = rss_after - rss_before
+        tested.assert({
+            expected = true,
+            actual = rss_delta < 2048,
+            message = string.format(
+                "expected error-path RSS growth < 2048 KiB, got %d KiB (before=%d, after=%d)",
+                rss_delta,
+                rss_before,
+                rss_after
+            ),
+        })
+    end)
+
+    os.remove(tmp_syntax)
+    os.remove(tmp_unknown)
+    if not ok_run then
+        error(run_err, 0)
+    end
+end)
+
 return t

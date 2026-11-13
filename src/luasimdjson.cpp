@@ -112,6 +112,28 @@ static void luaL_setfuncs(lua_State *L, const luaL_Reg *l, int nup) {
 thread_local ondemand::parser ondemand_parser;
 thread_local std::unique_ptr<char[]> parse_buffer;
 thread_local size_t parse_buffer_capacity = 0;
+thread_local simdjson::padded_string file_parse_buffer;
+
+static void shrink_decode_buffers(size_t desired_buffer_size,
+                                  int max_depth) noexcept {
+  file_parse_buffer = simdjson::padded_string();
+  size_t max_retained = desired_buffer_size + SIMDJSON_PADDING;
+  if (parse_buffer_capacity > max_retained) {
+    char *replacement = new (std::nothrow) char[max_retained];
+    if (replacement != nullptr) {
+      parse_buffer.reset(replacement);
+      parse_buffer_capacity = max_retained;
+    } else {
+      parse_buffer.reset();
+      parse_buffer_capacity = 0;
+    }
+  }
+  if (ondemand_parser.capacity() > max_retained) {
+    ondemand_parser = ondemand::parser{};
+    (void)ondemand_parser.allocate(desired_buffer_size,
+                                   static_cast<size_t>(max_depth));
+  }
+}
 
 static int absolute_index(lua_State *L, int index) {
   if (index > 0 || index <= LUA_REGISTRYINDEX) {
@@ -461,7 +483,8 @@ static bool convert_ondemand_element_to_table(lua_State *L, T &element,
 static LUA_SIMDJSON_NOINLINE decode_outcome
 parse_value(lua_State *L, const char *json_str, size_t json_str_len,
             int max_depth, size_t desired_buffer_size) {
-  (void)desired_buffer_size;
+  shrink_decode_buffers(desired_buffer_size, max_depth);
+
   if (json_str_len > std::numeric_limits<size_t>::max() - SIMDJSON_PADDING) {
     return {decode_status::input_too_large, simdjson::SUCCESS, 0};
   }
@@ -482,50 +505,59 @@ parse_value(lua_State *L, const char *json_str, size_t json_str_len,
 
   ondemand::document doc;
   if (auto error = ondemand_parser.iterate(padded_view).get(doc); error) {
+    shrink_decode_buffers(desired_buffer_size, max_depth);
     return {decode_status::simdjson_error, error, 0};
   }
 
   decode_context context{max_depth};
   if (!convert_ondemand_element_to_table(L, doc, context)) {
+    shrink_decode_buffers(desired_buffer_size, max_depth);
     return {context.status, context.error, context.detail};
   }
 
   if (!doc.at_end()) {
+    shrink_decode_buffers(desired_buffer_size, max_depth);
     return {decode_status::simdjson_error, simdjson::TRAILING_CONTENT, 0};
   }
 
+  shrink_decode_buffers(desired_buffer_size, max_depth);
   return {decode_status::ok, simdjson::SUCCESS, 0};
 }
 
 static LUA_SIMDJSON_NOINLINE decode_outcome
 parse_file_value(lua_State *L, const char *json_file, size_t json_file_len,
                  int max_depth, size_t desired_buffer_size) {
-  (void)desired_buffer_size;
+  shrink_decode_buffers(desired_buffer_size, max_depth);
+
   if (std::memchr(json_file, '\0', json_file_len) != nullptr) {
     return {decode_status::simdjson_error, simdjson::IO_ERROR, 0};
   }
 
-  thread_local simdjson::padded_string file_parse_buffer;
   if (auto error =
           simdjson::padded_string::load(json_file).get(file_parse_buffer);
       error) {
+    shrink_decode_buffers(desired_buffer_size, max_depth);
     return {decode_status::simdjson_error, error, 0};
   }
 
   ondemand::document doc;
   if (auto error = ondemand_parser.iterate(file_parse_buffer).get(doc); error) {
+    shrink_decode_buffers(desired_buffer_size, max_depth);
     return {decode_status::simdjson_error, error, 0};
   }
 
   decode_context context{max_depth};
   if (!convert_ondemand_element_to_table(L, doc, context)) {
+    shrink_decode_buffers(desired_buffer_size, max_depth);
     return {context.status, context.error, context.detail};
   }
 
   if (!doc.at_end()) {
+    shrink_decode_buffers(desired_buffer_size, max_depth);
     return {decode_status::simdjson_error, simdjson::TRAILING_CONTENT, 0};
   }
 
+  shrink_decode_buffers(desired_buffer_size, max_depth);
   return {decode_status::ok, simdjson::SUCCESS, 0};
 }
 
