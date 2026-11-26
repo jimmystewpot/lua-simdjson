@@ -245,15 +245,31 @@ static bool is_decode_active_on_call_stack(lua_State *L, int start_level) {
   return false;
 }
 
+static void shrink_decode_buffers(reusable_decode_state &state,
+                                  size_t desired_buffer_size) noexcept {
+  state.file_parse_buffer = simdjson::padded_string();
+  size_t max_retained = desired_buffer_size + SIMDJSON_PADDING;
+  if (state.parse_buffer_capacity > max_retained) {
+    state.parse_buffer.reset();
+    state.parse_buffer_capacity = 0;
+  }
+  if (state.parser.capacity() > desired_buffer_size) {
+    state.parser = ondemand::parser{};
+  }
+}
+
 struct decode_state_lease {
   reusable_decode_state *state;
   reusable_decode_state **fallback_slot;
   decode_vm_lease *owner_vm;
   lua_State *lease_thread;
+  size_t desired_buffer_size;
   int fallback_index;
   bool using_tls;
 
-  decode_state_lease(lua_State *L, decode_vm_lease *vm_lease) {
+  decode_state_lease(lua_State *L, decode_vm_lease *vm_lease,
+                     size_t buffer_size)
+      : desired_buffer_size(buffer_size) {
     lua_State *prev_thread =
         (tls_decode_state.in_use && tls_decode_state.owner_vm != nullptr)
             ? tls_decode_state.owner_vm->active_thread
@@ -280,6 +296,7 @@ struct decode_state_lease {
       lease_thread = L;
       fallback_index = 0;
       using_tls = true;
+      shrink_decode_buffers(*state, desired_buffer_size);
     } else {
       reusable_decode_state **slot = reinterpret_cast<reusable_decode_state **>(
           lua_newuserdata(L, sizeof(reusable_decode_state *)));
@@ -298,6 +315,7 @@ struct decode_state_lease {
 
   ~decode_state_lease() {
     if (using_tls) {
+      shrink_decode_buffers(*state, desired_buffer_size);
       write_active_decode_thread(owner_vm, lease_thread, false);
       tls_decode_state.in_use = false;
       tls_decode_state.owner_vm = nullptr;
@@ -311,19 +329,6 @@ struct decode_state_lease {
     }
   }
 };
-
-static void shrink_decode_buffers(reusable_decode_state &state,
-                                  size_t desired_buffer_size) noexcept {
-  state.file_parse_buffer = simdjson::padded_string();
-  size_t max_retained = desired_buffer_size + SIMDJSON_PADDING;
-  if (state.parse_buffer_capacity > max_retained) {
-    state.parse_buffer.reset();
-    state.parse_buffer_capacity = 0;
-  }
-  if (state.parser.capacity() > desired_buffer_size) {
-    state.parser = ondemand::parser{};
-  }
-}
 
 static simdjson::error_code
 ensure_ondemand_parser_ready(ondemand::parser &parser, size_t doc_len,
@@ -703,12 +708,11 @@ static bool convert_ondemand_element_to_table(lua_State *L, T &element,
 static LUA_SIMDJSON_NOINLINE decode_outcome
 parse_value(lua_State *L, decode_vm_lease *vm_lease, const char *json_str,
             size_t json_str_len, int max_depth, size_t desired_buffer_size) {
-  decode_state_lease lease(L, vm_lease);
+  decode_state_lease lease(L, vm_lease, desired_buffer_size);
   if (lease.state == nullptr) {
     return {decode_status::allocation_failed, simdjson::SUCCESS, 0};
   }
   reusable_decode_state &state = *lease.state;
-  shrink_decode_buffers(state, desired_buffer_size);
 
   if (json_str_len > std::numeric_limits<size_t>::max() - SIMDJSON_PADDING) {
     return {decode_status::input_too_large, simdjson::SUCCESS, 0};
@@ -738,13 +742,11 @@ parse_value(lua_State *L, decode_vm_lease *vm_lease, const char *json_str,
   if (auto error = ensure_ondemand_parser_ready(state.parser, json_str_len,
                                                 desired_buffer_size, max_depth);
       error) {
-    shrink_decode_buffers(state, desired_buffer_size);
     return {decode_status::simdjson_error, error, 0};
   }
 
   ondemand::document doc;
   if (auto error = state.parser.iterate(padded_view).get(doc); error) {
-    shrink_decode_buffers(state, desired_buffer_size);
     return {decode_status::simdjson_error, error, 0};
   }
 
@@ -752,29 +754,25 @@ parse_value(lua_State *L, decode_vm_lease *vm_lease, const char *json_str,
   decode_context context{max_depth};
   if (!convert_ondemand_element_to_table(L, doc, context)) {
     lua_settop(L, initial_top);
-    shrink_decode_buffers(state, desired_buffer_size);
     return {context.status, context.error, context.detail};
   }
 
   if (!doc.at_end()) {
     lua_settop(L, initial_top);
-    shrink_decode_buffers(state, desired_buffer_size);
     return {decode_status::simdjson_error, simdjson::TRAILING_CONTENT, 0};
   }
 
-  shrink_decode_buffers(state, desired_buffer_size);
   return {decode_status::ok, simdjson::SUCCESS, 0};
 }
 
 static LUA_SIMDJSON_NOINLINE decode_outcome parse_file_value(
     lua_State *L, decode_vm_lease *vm_lease, const char *json_file,
     size_t json_file_len, int max_depth, size_t desired_buffer_size) {
-  decode_state_lease lease(L, vm_lease);
+  decode_state_lease lease(L, vm_lease, desired_buffer_size);
   if (lease.state == nullptr) {
     return {decode_status::allocation_failed, simdjson::SUCCESS, 0};
   }
   reusable_decode_state &state = *lease.state;
-  shrink_decode_buffers(state, desired_buffer_size);
 
   if (std::memchr(json_file, '\0', json_file_len) != nullptr) {
     return {decode_status::simdjson_error, simdjson::IO_ERROR, 0};
@@ -783,7 +781,6 @@ static LUA_SIMDJSON_NOINLINE decode_outcome parse_file_value(
   if (auto error =
           simdjson::padded_string::load(json_file).get(state.file_parse_buffer);
       error) {
-    shrink_decode_buffers(state, desired_buffer_size);
     return {decode_status::simdjson_error, error, 0};
   }
 
@@ -791,14 +788,12 @@ static LUA_SIMDJSON_NOINLINE decode_outcome parse_file_value(
                                                 state.file_parse_buffer.size(),
                                                 desired_buffer_size, max_depth);
       error) {
-    shrink_decode_buffers(state, desired_buffer_size);
     return {decode_status::simdjson_error, error, 0};
   }
 
   ondemand::document doc;
   if (auto error = state.parser.iterate(state.file_parse_buffer).get(doc);
       error) {
-    shrink_decode_buffers(state, desired_buffer_size);
     return {decode_status::simdjson_error, error, 0};
   }
 
@@ -806,17 +801,14 @@ static LUA_SIMDJSON_NOINLINE decode_outcome parse_file_value(
   decode_context context{max_depth};
   if (!convert_ondemand_element_to_table(L, doc, context)) {
     lua_settop(L, initial_top);
-    shrink_decode_buffers(state, desired_buffer_size);
     return {context.status, context.error, context.detail};
   }
 
   if (!doc.at_end()) {
     lua_settop(L, initial_top);
-    shrink_decode_buffers(state, desired_buffer_size);
     return {decode_status::simdjson_error, simdjson::TRAILING_CONTENT, 0};
   }
 
-  shrink_decode_buffers(state, desired_buffer_size);
   return {decode_status::ok, simdjson::SUCCESS, 0};
 }
 
