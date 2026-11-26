@@ -461,6 +461,13 @@ static void write_decode_buffer_size(lua_State *L, size_t buffer_size) {
   lua_rawset(L, LUA_REGISTRYINDEX);
 }
 
+#define DECODE_TRY(expr, out)                                                  \
+  do {                                                                         \
+    if (auto err_ = (expr).get(out); err_) {                                   \
+      return fail_simdjson(context, err_);                                     \
+    }                                                                          \
+  } while (0)
+
 template <typename T>
 static LUA_SIMDJSON_NOINLINE bool
 convert_ondemand_scalar_to_table(lua_State *L, T &element,
@@ -472,30 +479,20 @@ convert_ondemand_scalar_to_table(lua_State *L, T &element,
     if (auto error = element.get_number().get(number); error) {
       if (error == simdjson::BIGINT_ERROR) {
         double value = 0;
-        if (auto dbl_error = element.get_double().get(value); dbl_error) {
-          return fail_simdjson(context, dbl_error);
-        }
+        DECODE_TRY(element.get_double(), value);
         lua_pushnumber(L, value);
         return true;
       }
       return fail_simdjson(context, error);
     }
-    ondemand::number_type number_type = number.get_number_type();
-    switch (number_type) {
-    case SIMDJSON_BUILTIN_IMPLEMENTATION::number_type::floating_point_number: {
-      double value = 0;
-      if (auto error = element.get_double().get(value); error) {
-        return fail_simdjson(context, error);
-      }
-      lua_pushnumber(L, value);
+
+    switch (number.get_number_type()) {
+    case SIMDJSON_BUILTIN_IMPLEMENTATION::number_type::floating_point_number:
+      lua_pushnumber(L, number.get_double());
       break;
-    }
 
     case SIMDJSON_BUILTIN_IMPLEMENTATION::number_type::signed_integer: {
-      int64_t value = 0;
-      if (auto error = element.get_int64().get(value); error) {
-        return fail_simdjson(context, error);
-      }
+      int64_t value = number.get_int64();
 #if defined(LUA_MAXINTEGER) && defined(LUA_MININTEGER)
       if (value < LUA_MININTEGER || value > LUA_MAXINTEGER) {
         lua_pushnumber(L, static_cast<lua_Number>(value));
@@ -510,62 +507,44 @@ convert_ondemand_scalar_to_table(lua_State *L, T &element,
 
     case SIMDJSON_BUILTIN_IMPLEMENTATION::number_type::unsigned_integer: {
 // a uint64 can be greater than an int64, so we must check how large and pass as
-// a number if larger but LUA_MAXINTEGER (which is only defined in 5.3+)
+// a number if larger than LUA_MAXINTEGER (which is only defined in 5.3+)
 #if defined(LUA_MAXINTEGER)
-      uint64_t actual_value = 0;
-      if (auto error = element.get_uint64().get(actual_value); error) {
-        return fail_simdjson(context, error);
-      }
-      if (actual_value > LUA_MAXINTEGER) {
-        lua_pushnumber(L, actual_value);
+      uint64_t actual_value = number.get_uint64();
+      if (actual_value > static_cast<uint64_t>(LUA_MAXINTEGER)) {
+        lua_pushnumber(L, static_cast<lua_Number>(actual_value));
       } else {
-        lua_pushinteger(L, actual_value);
+        lua_pushinteger(L, static_cast<lua_Integer>(actual_value));
       }
 #else
-      double value = 0;
-      if (auto error = element.get_double().get(value); error) {
-        return fail_simdjson(context, error);
-      }
-      lua_pushnumber(L, value);
+      lua_pushnumber(L, number.as_double());
 #endif
       break;
     }
 
-    case SIMDJSON_BUILTIN_IMPLEMENTATION::number_type::big_integer: {
-      double value = 0;
-      if (auto error = element.get_double().get(value); error) {
-        return fail_simdjson(context, error);
-      }
-      lua_pushnumber(L, value);
+    case SIMDJSON_BUILTIN_IMPLEMENTATION::number_type::big_integer:
+      lua_pushnumber(L, number.as_double());
       break;
-    }
     }
     return true;
   }
 
   case ondemand::json_type::string: {
     std::string_view s;
-    if (auto error = element.get_string().get(s); error) {
-      return fail_simdjson(context, error);
-    }
+    DECODE_TRY(element.get_string(), s);
     lua_pushlstring(L, s.data(), s.size());
     return true;
   }
 
   case ondemand::json_type::boolean: {
     bool value = false;
-    if (auto error = element.get_bool().get(value); error) {
-      return fail_simdjson(context, error);
-    }
+    DECODE_TRY(element.get_bool(), value);
     lua_pushboolean(L, value);
     return true;
   }
 
   case ondemand::json_type::null: {
     bool is_null = false;
-    if (auto error = element.is_null().get(is_null); error) {
-      return fail_simdjson(context, error);
-    }
+    DECODE_TRY(element.is_null(), is_null);
     if (!is_null) {
       return fail_simdjson(context, simdjson::INCORRECT_TYPE);
     }
@@ -586,13 +565,9 @@ push_object_field_key(lua_State *L,
                       simdjson_result<ondemand::field> &field_result,
                       ondemand::value &child, decode_context &context) {
   ondemand::field field;
-  if (auto error = std::move(field_result).get(field); error) {
-    return fail_simdjson(context, error);
-  }
+  DECODE_TRY(std::move(field_result), field);
   std::string_view s;
-  if (auto error = field.unescaped_key().get(s); error) {
-    return fail_simdjson(context, error);
-  }
+  DECODE_TRY(field.unescaped_key(), s);
   lua_pushlstring(L, s.data(), s.size());
   child = std::move(field).value();
   return true;
@@ -602,9 +577,7 @@ template <typename T>
 static LUA_SIMDJSON_NOINLINE bool
 prepare_element_type(T &element, ondemand::json_type &type,
                      decode_context &context) {
-  if (auto error = element.type().get(type); error) {
-    return fail_simdjson(context, error);
-  }
+  DECODE_TRY(element.type(), type);
   return true;
 }
 
@@ -619,9 +592,7 @@ static LUA_SIMDJSON_NOINLINE bool prepare_array(lua_State *L, T &element,
   if (!lua_checkstack(L, DECODE_STACK_SLOTS_PER_TABLE)) {
     return fail_status(context, decode_status::stack_overflow);
   }
-  if (auto error = element.get_array().get(array); error) {
-    return fail_simdjson(context, error);
-  }
+  DECODE_TRY(element.get_array(), array);
   context.current_depth++;
   lua_newtable(L);
   return true;
@@ -638,9 +609,7 @@ static LUA_SIMDJSON_NOINLINE bool prepare_object(lua_State *L, T &element,
   if (!lua_checkstack(L, DECODE_STACK_SLOTS_PER_TABLE)) {
     return fail_status(context, decode_status::stack_overflow);
   }
-  if (auto error = element.get_object().get(object); error) {
-    return fail_simdjson(context, error);
-  }
+  DECODE_TRY(element.get_object(), object);
   context.current_depth++;
   lua_newtable(L);
   return true;
@@ -668,9 +637,7 @@ static bool convert_ondemand_element_to_table(lua_State *L, T &element,
     int count = 1;
     for (simdjson_result<ondemand::value> child_result : array) {
       ondemand::value child;
-      if (auto error = child_result.get(child); error) {
-        return fail_simdjson(context, error);
-      }
+      DECODE_TRY(child_result, child);
       if (!convert_ondemand_element_to_table(L, child, context)) {
         return false;
       }
@@ -704,6 +671,8 @@ static bool convert_ondemand_element_to_table(lua_State *L, T &element,
     return convert_ondemand_scalar_to_table(L, element, type, context);
   }
 }
+
+#undef DECODE_TRY
 
 static LUA_SIMDJSON_NOINLINE decode_outcome
 parse_value(lua_State *L, decode_vm_lease *vm_lease, const char *json_str,
